@@ -1174,6 +1174,21 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                 app.auth = AuthStatus::SignedOut;
                 app.user = None;
             }
+            // Google sign-in waiting for its code to be confirmed.
+            "sign-in-google-waiting" => {
+                app.auth = AuthStatus::WaitingForGoogle {
+                    user_code: "WXYZ-ABCD".into(),
+                    url: "https://www.google.com/device?user_code=WXYZ-ABCD".into(),
+                };
+                app.sign_in_url = Some("https://www.google.com/device?user_code=WXYZ-ABCD".into());
+                app.user = None;
+            }
+            // The advanced cookie sign-in, open.
+            "sign-in-cookie" => {
+                app.auth = AuthStatus::SignedOut;
+                app.user = None;
+                app.login_cookie_open = true;
+            }
             "sign-in-malformed" | "sign-in-missing-sapisid" | "sign-in-expired" => {
                 use crate::backend::SignInProblem;
                 app.auth = AuthStatus::Refused(match surface {
@@ -6939,10 +6954,18 @@ mod tests {
         let states = [
             AuthStatus::SignedOut,
             AuthStatus::Connecting,
-            // The longest explanations, beside the cookie steps.
+            AuthStatus::WaitingForGoogle {
+                user_code: "WXYZ-ABCD".into(),
+                url: "https://www.google.com/device?user_code=WXYZ-ABCD".into(),
+            },
+            // The longest explanations, beside the Google steps.
             AuthStatus::Refused(crate::backend::SignInProblem::MalformedCookie),
             AuthStatus::Refused(crate::backend::SignInProblem::MissingSapisid),
             AuthStatus::Refused(crate::backend::SignInProblem::Expired),
+            AuthStatus::Refused(crate::backend::SignInProblem::MissingOAuthClient),
+            AuthStatus::Refused(crate::backend::SignInProblem::OAuthInvalidClient),
+            AuthStatus::Refused(crate::backend::SignInProblem::OAuthDenied),
+            AuthStatus::Refused(crate::backend::SignInProblem::OAuthExpired),
         ];
         for size in [
             egui::vec2(
@@ -6986,8 +7009,14 @@ mod tests {
                 }
                 title.unwrap_or_else(|| panic!("the card was drawn in {state:?}"))
             };
-            for state in &states {
+            // Each state beside the Google steps, then with the advanced
+            // cookie sign-in open.
+            for (state, cookie) in states
+                .iter()
+                .flat_map(|state| [(state, false), (state, true)])
+            {
                 app.auth = state.clone();
+                app.login_cookie_open = cookie;
                 app.user = None;
                 let before = title(&draw(&mut app, Vec::new()), state);
                 // A card with nothing hidden has nothing to scroll, and so

@@ -68,9 +68,13 @@ impl Credentials {
     }
 
     /// The cookie, when it is one a request can carry (`name=value; ...`).
+    /// A Google OAuth token is never sent as a cookie.
     fn request_cookie(&self) -> Option<String> {
         let cookie = self.cookie.trim();
-        (cookie.contains('=') && !cookie.contains(['\r', '\n'])).then(|| cookie.to_string())
+        (cookie.contains('=')
+            && !cookie.contains(['\r', '\n'])
+            && !crate::auth::is_oauth_blob(cookie))
+        .then(|| cookie.to_string())
     }
 }
 
@@ -2407,6 +2411,11 @@ mod tests {
             cookie.request_cookie().as_deref(),
             Some("SID=abc; HSID=def")
         );
+        let token = Credentials::with_cookie(
+            crate::auth::OAUTH_ACCOUNT,
+            r#"{"access_token":"a=b","refresh_token":"c"}"#,
+        );
+        assert_eq!(token.request_cookie(), None, "a token is not a cookie");
     }
 
     #[test]

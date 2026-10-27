@@ -14,6 +14,8 @@ use crate::theme;
 const COLUMN: f32 = 368.0;
 /// The space between the sign-in column and the sign-in steps.
 const GUTTER: f32 = 40.0;
+/// Whether the OAuth client fields are open while a client is configured.
+const CLIENT_OPEN_ID: &str = "login-oauth-client-open";
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, connecting: bool) {
     let palette = app.palette;
@@ -36,7 +38,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, connecting: bool) {
             fastframe_titlebar::drag(ui, drag_rect);
             let top = super::blend(palette.window, palette.accent, 0.10);
             super::widgets::paint_vertical_gradient(ui, rect, top, palette.window);
-            let steps = !connecting;
+            let waiting = matches!(app.auth, AuthStatus::WaitingForGoogle { .. });
+            let steps = !connecting && !waiting;
+            let cookie = app.login_cookie_open;
             // Two columns share what the window has beside the card's
             // margins, down to the smallest main window.
             let column = if steps {
@@ -100,7 +104,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, connecting: bool) {
                                     ui.allocate_ui_with_layout(
                                         Vec2::new(column, 0.0),
                                         Layout::top_down(Align::Min),
-                                        |ui| cookie_steps(app, ui, column),
+                                        |ui| {
+                                            if cookie {
+                                                cookie_steps(app, ui, column)
+                                            } else {
+                                                google_steps(app, ui, column)
+                                            }
+                                        },
                                     );
                                 });
                             } else {
@@ -140,9 +150,24 @@ fn problem_text(locale: crate::i18n::Locale, problem: SignInProblem) -> String {
             locale,
             "That cookie has no SAPISID. Copy it from a signed-in music.youtube.com tab.",
         ),
-        SignInProblem::Expired => gettext(
+        SignInProblem::Expired => {
+            gettext(locale, "Your YouTube Music sign-in expired. Sign in again.")
+        }
+        SignInProblem::MissingOAuthClient => gettext(
             locale,
-            "Your YouTube Music sign-in expired. Paste a fresh cookie.",
+            "Enter the Client ID and Client secret of your Google OAuth client first.",
+        ),
+        SignInProblem::OAuthInvalidClient => gettext(
+            locale,
+            "Google rejected that client. Its type must be TVs and Limited Input devices.",
+        ),
+        SignInProblem::OAuthDenied => gettext(
+            locale,
+            "Google sign-in was declined. Try again and allow access.",
+        ),
+        SignInProblem::OAuthExpired => gettext(
+            locale,
+            "The Google code expired before it was confirmed. Try again.",
         ),
     }
     .into_owned()
@@ -152,7 +177,7 @@ fn wrapped(ui: &mut egui::Ui, text: impl Into<String>, font: egui::FontId, color
     ui.add(egui::Label::new(egui::RichText::new(text.into()).font(font).color(color)).wrap());
 }
 
-/// The logo, the cookie field and the button: everything that signs in.
+/// The logo, the sign-in fields and the button: everything that signs in.
 /// Beside the steps, `beside` is the column's width.
 fn sign_in_column(app: &mut App, ui: &mut egui::Ui, connecting: bool, beside: Option<f32>) {
     let palette = app.palette;
@@ -162,7 +187,7 @@ fn sign_in_column(app: &mut App, ui: &mut egui::Ui, connecting: bool, beside: Op
     ui.spacing_mut().item_spacing.y = 8.0;
     // Beside the steps the card has more to hold in the same height, so
     // the heading is smaller.
-    let logo_size = if steps { 56.0 } else { 72.0 };
+    let logo_size = if steps { 48.0 } else { 72.0 };
     let (logo, _) = ui.allocate_exact_size(Vec2::splat(logo_size), egui::Sense::hover());
     theme::logo(ui, logo.center(), logo_size);
     ui.add_space(6.0);
@@ -180,8 +205,11 @@ fn sign_in_column(app: &mut App, ui: &mut egui::Ui, connecting: bool, beside: Op
             palette.secondary,
         );
     }
-    ui.add_space(if steps { 12.0 } else { 22.0 });
-    if connecting {
+    ui.add_space(if steps { 10.0 } else { 22.0 });
+    if let AuthStatus::WaitingForGoogle { user_code, url } = &app.auth {
+        let (user_code, url) = (user_code.clone(), url.clone());
+        waiting_for_google(app, ui, &user_code, &url);
+    } else if connecting {
         ui.horizontal(|ui| {
             ui.add_space((ui.available_width() - 250.0).max(0.0) / 2.0);
             theme::spinner(ui, 18.0, palette.accent);
@@ -206,33 +234,59 @@ fn sign_in_column(app: &mut App, ui: &mut egui::Ui, connecting: bool, beside: Op
             wrapped(ui, problem, theme::regular(13.0), palette.danger);
             ui.add_space(4.0);
         }
-        cookie_field(app, ui);
-        ui.add_space(4.0);
-        let ready = crate::auth::looks_like_cookie(&app.login_cookie);
-        if ui
-            .add_enabled_ui(ready, |ui| {
-                big_button(ui, app, &gettext(locale, "Sign in with YouTube Music"))
-            })
-            .inner
-        {
-            app.actions.push(Action::SignIn);
+        let cookie = app.login_cookie_open;
+        if cookie {
+            cookie_field(app, ui);
+            ui.add_space(4.0);
+            let ready = crate::auth::looks_like_cookie(&app.login_cookie);
+            if ui
+                .add_enabled_ui(ready, |ui| {
+                    big_button(ui, app, &gettext(locale, "Sign in with the cookie"))
+                })
+                .inner
+            {
+                app.actions.push(Action::SignInCookie);
+            }
+            ui.add_space(6.0);
+            wrapped(
+                ui,
+                gettext(
+                    locale,
+                    "The cookie works like a password. Ytmfast keeps it in your system's credential store and sends it only to YouTube.",
+                ),
+                theme::regular(12.0),
+                palette.secondary,
+            );
+        } else {
+            google_fields(app, ui);
+            let ready = app.settings.oauth_client().is_some();
+            if ui
+                .add_enabled_ui(ready, |ui| {
+                    big_button(ui, app, &gettext(locale, "Sign in with Google"))
+                })
+                .inner
+            {
+                app.actions.push(Action::SignIn);
+            }
         }
-        ui.add_space(10.0);
-        wrapped(
-            ui,
-            gettext(
-                locale,
-                "The cookie works like a password. Ytmfast keeps it in your system's credential store and sends it only to YouTube.",
-            ),
-            theme::regular(12.5),
-            palette.secondary,
-        );
+        ui.add_space(2.0);
+        let switch = if cookie {
+            gettext(locale, "Sign in with Google instead")
+        } else {
+            gettext(locale, "Advanced: paste a browser cookie")
+        };
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                if theme::link(ui, switch, theme::regular(13.0), palette.secondary).clicked() {
+                    app.login_cookie_open = !cookie;
+                }
+            });
+        });
     }
     let proxy_id = egui::Id::new("login-proxy-open");
     let mut proxy_open = ui
         .data(|data| data.get_temp::<bool>(proxy_id))
         .unwrap_or(false);
-    ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.with_layout(Layout::top_down(Align::Center), |ui| {
             if theme::link(
@@ -252,6 +306,147 @@ fn sign_in_column(app: &mut App, ui: &mut egui::Ui, connecting: bool, beside: Op
         proxy_fields(ui, app);
     }
     ui.data_mut(|data| data.insert_temp(proxy_id, proxy_open));
+}
+
+/// The code to confirm on Google's page, while Ytmfast waits for it.
+fn waiting_for_google(app: &mut App, ui: &mut egui::Ui, user_code: &str, url: &str) {
+    let palette = app.palette;
+    let locale = app.locale;
+    theme::text(
+        ui,
+        gettext(locale, "Enter this code on Google's page:"),
+        theme::regular(14.0),
+        palette.secondary,
+    );
+    Frame::new()
+        .fill(palette.surface)
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(20, 10))
+        .show(ui, |ui| {
+            let code = ui.add(
+                egui::Label::new(
+                    egui::RichText::new(user_code)
+                        .font(egui::FontId::monospace(28.0))
+                        .strong()
+                        .color(palette.text),
+                )
+                .selectable(true),
+            );
+            code.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Label, true, user_code)
+            });
+        });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.add_space((ui.available_width() - 190.0).max(0.0) / 2.0);
+        theme::spinner(ui, 16.0, palette.accent);
+        theme::text(
+            ui,
+            gettext(locale, "Waiting for Google…"),
+            theme::medium(14.0),
+            palette.text,
+        );
+    });
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::top_down(Align::Center), |ui| {
+            ui.horizontal(|ui| {
+                if theme::pill_button(ui, &palette, &gettext(locale, "Open browser again"), true)
+                    .on_hover_text(url)
+                    .clicked()
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
+                if theme::pill_button(ui, &palette, &gettext(locale, "Cancel"), false).clicked() {
+                    app.actions.push(Action::CancelSignIn);
+                }
+            });
+        });
+    });
+}
+
+/// One line of the OAuth client form. Settings keep what is typed.
+fn client_field(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    id: &str,
+    hint: &str,
+    secret: bool,
+    value: impl Fn(&mut crate::settings::Settings) -> &mut Option<String>,
+) {
+    let palette = app.palette;
+    let locale = app.locale;
+    let mut text = value(&mut app.settings).clone().unwrap_or_default();
+    let response = Frame::new()
+        .fill(palette.surface)
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 7))
+        .show(ui, |ui| {
+            super::widgets::text_edit(
+                ui,
+                locale,
+                egui::TextEdit::singleline(&mut text)
+                    .id(egui::Id::new(id))
+                    .password(secret)
+                    .hint_text(egui::RichText::new(hint).color(palette.dim))
+                    .font(theme::regular(13.5))
+                    .frame(egui::Frame::NONE)
+                    .desired_width(ui.available_width()),
+            )
+        })
+        .inner;
+    if response.changed() {
+        let trimmed = text.trim();
+        *value(&mut app.settings) = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        app.mark_settings_dirty();
+    }
+}
+
+/// The listener's Google OAuth client: its ID and secret, or once both are
+/// set, a link to change them.
+fn google_fields(app: &mut App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    let locale = app.locale;
+    let open_id = egui::Id::new(CLIENT_OPEN_ID);
+    let configured = app.settings.oauth_client().is_some();
+    let mut open = ui
+        .data(|data| data.get_temp::<bool>(open_id))
+        .unwrap_or(false);
+    if configured && !open {
+        ui.horizontal(|ui| {
+            ui.with_layout(Layout::top_down(Align::Center), |ui| {
+                if theme::link(
+                    ui,
+                    gettext(locale, "Change the Google OAuth client"),
+                    theme::regular(12.5),
+                    palette.secondary,
+                )
+                .clicked()
+                {
+                    open = true;
+                }
+            });
+        });
+    } else {
+        client_field(
+            app,
+            ui,
+            "login-oauth-client-id",
+            &gettext(locale, "OAuth Client ID"),
+            false,
+            |settings| &mut settings.oauth_client_id,
+        );
+        client_field(
+            app,
+            ui,
+            "login-oauth-client-secret",
+            &gettext(locale, "OAuth Client secret"),
+            true,
+            |settings| &mut settings.oauth_client_secret,
+        );
+    }
+    ui.data_mut(|data| data.insert_temp(open_id, open));
+    ui.add_space(2.0);
 }
 
 /// The pasted cookie. It is masked, never saved to settings, and only kept
@@ -323,6 +518,84 @@ fn step(
         });
     });
     ui.add_space(4.0);
+}
+
+/// How to create the Google OAuth client, the way youtui documents it.
+fn google_steps(app: &mut App, ui: &mut egui::Ui, width: f32) {
+    let palette = app.palette;
+    let locale = app.locale;
+    let ctx = ui.ctx().clone();
+    ui.set_width(width);
+    ui.spacing_mut().item_spacing.y = 6.0;
+    ui.add_space(4.0);
+    theme::text(
+        ui,
+        gettext(locale, "Set up Sign in with Google"),
+        theme::bold(18.0),
+        palette.text,
+    );
+    ui.add_space(6.0);
+    step(
+        ui,
+        &palette,
+        1,
+        &gettext(
+            locale,
+            "In Google Cloud, enable the YouTube Data API v3 for a project:",
+        ),
+        |ui| {
+            if theme::link(
+                ui,
+                gettext(locale, "How to register an app"),
+                theme::medium(13.0),
+                palette.accent,
+            )
+            .on_hover_text(crate::auth::OAUTH_SETUP_URL)
+            .clicked()
+            {
+                ctx.open_url(egui::OpenUrl::new_tab(crate::auth::OAUTH_SETUP_URL));
+            }
+        },
+    );
+    step(
+        ui,
+        &palette,
+        2,
+        &gettext(
+            locale,
+            "Create an OAuth client ID of type TVs and Limited Input devices:",
+        ),
+        |ui| {
+            if theme::link(
+                ui,
+                gettext(locale, "Credentials"),
+                theme::medium(13.0),
+                palette.accent,
+            )
+            .on_hover_text(crate::auth::OAUTH_CONSOLE_URL)
+            .clicked()
+            {
+                ctx.open_url(egui::OpenUrl::new_tab(crate::auth::OAUTH_CONSOLE_URL));
+            }
+        },
+    );
+    step(
+        ui,
+        &palette,
+        3,
+        &gettext(
+            locale,
+            "Paste its Client ID and Client secret here and sign in.",
+        ),
+        |_| {},
+    );
+    step(
+        ui,
+        &palette,
+        4,
+        &gettext(locale, "Confirm the code Ytmfast shows on Google's page."),
+        |_| {},
+    );
 }
 
 /// How to copy the cookie, the way ytmapi-rs and youtui document it.
@@ -558,7 +831,7 @@ mod tests {
             bounds.y0 >= 0.0 && bounds.y1 <= 480.0
         };
         let first = frame(vec![]);
-        assert!(visible_button(&first, "Sign in with YouTube Music"));
+        assert!(visible_button(&first, "Sign in with Google"));
         let center = |label: &str| {
             let bounds = first
                 .nodes
@@ -571,7 +844,7 @@ mod tests {
             (bounds.x0 + bounds.x1) / 2.0
         };
         assert!(
-            (center("Proxy Settings") - center("Sign in with YouTube Music")).abs() < 1.0,
+            (center("Proxy Settings") - center("Sign in with Google")).abs() < 1.0,
             "the proxy link stays centered under sign-in"
         );
         frame(vec![

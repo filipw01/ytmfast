@@ -404,7 +404,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
     let account = gettext(locale, "Account");
     let sign_out = gettext(locale, "Sign out");
-    let account_rows = [RowText::new(sign_out.clone(), account.clone())];
+    let oauth_note = gettext(
+        locale,
+        "Your own Google Cloud OAuth client, of type TVs and Limited Input devices, for Sign in with Google.",
+    );
+    let account_rows = [
+        RowText::new(sign_out.clone(), account.clone()),
+        RowText::new(gettext(locale, "OAuth Client ID"), oauth_note.clone()),
+        RowText::new(gettext(locale, "OAuth Client secret"), oauth_note),
+    ];
     if section_matches(&needle, &account, &account_rows) {
         any_visible = true;
         section(ui, &palette, &account, |ui| {
@@ -457,6 +465,37 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     });
                 });
                 ui.add_space(10.0);
+            }
+            for (row, secret) in [(&account_rows[1], false), (&account_rows[2], true)] {
+                filtered_row(ui, &palette, &needle, &account, row, |ui| {
+                    let value = if secret {
+                        &mut app.settings.oauth_client_secret
+                    } else {
+                        &mut app.settings.oauth_client_id
+                    };
+                    let mut text = value.clone().unwrap_or_default();
+                    let response = Frame::new()
+                        .fill(palette.surface)
+                        .corner_radius(CornerRadius::same(6))
+                        .inner_margin(Margin::symmetric(10, 6))
+                        .show(ui, |ui| {
+                            widgets::text_edit(
+                                ui,
+                                locale,
+                                egui::TextEdit::singleline(&mut text)
+                                    .password(secret)
+                                    .font(theme::regular(14.0))
+                                    .frame(egui::Frame::NONE)
+                                    .desired_width(240.0),
+                            )
+                        })
+                        .inner;
+                    if response.changed() {
+                        let trimmed = text.trim();
+                        *value = (!trimmed.is_empty()).then(|| trimmed.to_string());
+                        changed = true;
+                    }
+                });
             }
         });
     }

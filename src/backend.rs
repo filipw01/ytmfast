@@ -99,6 +99,12 @@ pub enum AuthStatus {
     Starting,
     SignedOut,
     Connecting,
+    /// Google sign-in is waiting for the listener to confirm `user_code` at
+    /// `url`, which opened in the browser.
+    WaitingForGoogle {
+        user_code: String,
+        url: String,
+    },
     Connected {
         username: String,
     },
@@ -115,8 +121,35 @@ pub enum SignInProblem {
     MalformedCookie,
     /// A cookie, but not one from a signed-in music.youtube.com tab.
     MissingSapisid,
-    /// YouTube Music no longer accepts the cookie.
+    /// YouTube Music no longer accepts the cookie or token.
     Expired,
+    /// Sign in with Google needs the listener's OAuth Client ID and secret.
+    MissingOAuthClient,
+    /// Google does not know the OAuth client, or it is not of the type
+    /// "TVs and Limited Input devices".
+    OAuthInvalidClient,
+    /// The listener declined on Google's page.
+    OAuthDenied,
+    /// The code ran out before it was confirmed.
+    OAuthExpired,
+}
+
+impl SignInProblem {
+    fn from_oauth(problem: &crate::auth::OAuthProblem) -> Option<Self> {
+        use crate::auth::OAuthProblem;
+        match problem {
+            OAuthProblem::Denied => Some(Self::OAuthDenied),
+            OAuthProblem::Expired => Some(Self::OAuthExpired),
+            OAuthProblem::InvalidClient => Some(Self::OAuthInvalidClient),
+            OAuthProblem::Cancelled | OAuthProblem::Network(_) | OAuthProblem::Other(_) => None,
+        }
+    }
+}
+
+/// What the sign-in screen signs in with.
+enum SignInWith {
+    Cookie(Option<String>),
+    Google(crate::auth::OAuthClient),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -732,6 +765,13 @@ pub enum Command {
         config: ProxyConfig,
         cookie: Option<String>,
     },
+    /// Sign in with Google with the listener's own OAuth client.
+    SignInGoogle {
+        request: u64,
+        config: ProxyConfig,
+        client_id: String,
+        client_secret: String,
+    },
     CancelSignIn,
     SignOut,
     /// Start local playback on this computer with the signed-in cookie.
@@ -771,6 +811,17 @@ pub enum Command {
         lease: CredentialLease,
         attempt: u64,
         error: ApiError,
+    },
+    /// Internal: Google gave the code the listener confirms.
+    GoogleCodeShown {
+        attempt: u64,
+        user_code: String,
+        url: String,
+    },
+    /// Internal: Google sign-in ended with a token (as JSON) or why not.
+    GoogleSignInEnded {
+        attempt: u64,
+        result: Result<String, crate::auth::OAuthProblem>,
     },
     /// Internal: a cookie verification ended (success or not).
     SignInEnded {
@@ -1843,6 +1894,8 @@ struct Worker {
     /// The plan, once the Web API has answered.
     premium: Option<bool>,
     authorizing_source: Option<ApiSource>,
+    /// Stops the Google sign-in waiting for the listener, when one is.
+    google_sign_in: Option<watch::Sender<bool>>,
     reconnects: Vec<Instant>,
     /// What the engine was playing when it went down, to load again once
     /// the next one is up.
@@ -1942,6 +1995,7 @@ impl Worker {
             signed_in: false,
             premium: None,
             authorizing_source: None,
+            google_sign_in: None,
             reconnects: Vec::new(),
             resume: None,
             resume_verify: None,
@@ -1970,9 +2024,9 @@ impl Worker {
         Ok(restart)
     }
 
-    /// Applies a proxy, then signs in with `sign_in`'s cookie when that is
+    /// Applies a proxy, then signs in the way `sign_in` says when that is
     /// the sign-in screen's button.
-    fn change_proxy(&mut self, request: u64, proxy: ProxyConfig, sign_in: Option<Option<String>>) {
+    fn change_proxy(&mut self, request: u64, proxy: ProxyConfig, sign_in: Option<SignInWith>) {
         let result = self.apply_proxy(proxy.clone());
         if result.as_ref().is_ok_and(|restart| *restart) {
             self.replace_engine();
@@ -1989,8 +2043,10 @@ impl Worker {
         if applied {
             self.persist_proxy_password(&proxy);
             self.finish_proxy_restore();
-            if let Some(cookie) = sign_in {
-                self.sign_in(cookie);
+            match sign_in {
+                Some(SignInWith::Cookie(cookie)) => self.sign_in(cookie),
+                Some(SignInWith::Google(client)) => self.sign_in_google(client),
+                None => {}
             }
         }
     }
@@ -2108,6 +2164,7 @@ impl Worker {
                     Command::ProxyRestored { .. }
                         | Command::ApplyProxy { .. }
                         | Command::SignIn { .. }
+                        | Command::SignInGoogle { .. }
                         | Command::SignOut
                         | Command::CancelSignIn
                         | Command::Shutdown
@@ -2253,8 +2310,30 @@ impl Worker {
                     request,
                     config,
                     cookie,
-                } => self.change_proxy(request, config, Some(cookie)),
+                } => self.change_proxy(request, config, Some(SignInWith::Cookie(cookie))),
+                Command::SignInGoogle {
+                    request,
+                    config,
+                    client_id,
+                    client_secret,
+                } => self.change_proxy(
+                    request,
+                    config,
+                    Some(SignInWith::Google(crate::auth::OAuthClient {
+                        id: client_id,
+                        secret: client_secret,
+                    })),
+                ),
+                Command::GoogleCodeShown {
+                    attempt,
+                    user_code,
+                    url,
+                } => self.on_google_code(attempt, user_code, url),
+                Command::GoogleSignInEnded { attempt, result } => {
+                    self.on_google_sign_in_ended(attempt, result)
+                }
                 Command::CancelSignIn => {
+                    self.cancel_google_sign_in();
                     self.authorization_attempt += 1;
                     if let Some(source) = self.authorizing_source.take() {
                         self.credentials.invalidate(CredentialSlot::Playback);
@@ -2821,13 +2900,14 @@ impl Worker {
                 None
             }
         };
-        // Only the stored cookie opens a session; grants from the Spotify
-        // days are left alone and never sent anywhere.
+        // Only a stored cookie or Google token opens a session; grants from
+        // the Spotify days are left alone and never sent anywhere.
         if let Some(StoredGrant::Playback(grant)) = grant
             && slot == CredentialSlot::Playback
             && !self.signed_in
             && self.authorizing_source.is_none()
-            && let Ok(cookie) = crate::auth::normalize_cookie(&grant.cookie)
+            && self.google_sign_in.is_none()
+            && let Some(cookie) = crate::auth::stored_sign_in(&grant.cookie)
         {
             self.emit(Event::Auth(AuthStatus::Connecting));
             self.on_web_signed_in(ApiSource::Personal, cookie);
@@ -2991,10 +3071,11 @@ impl Worker {
         }
     }
 
-    /// The sign-in screen's button: the pasted browser cookie is the only way
-    /// in. It is checked for shape here and verified against YouTube Music
-    /// before anything is stored.
+    /// The sign-in screen's cookie button. The pasted cookie is checked for
+    /// shape here and verified against YouTube Music before anything is
+    /// stored.
     fn sign_in(&mut self, cookie: Option<String>) {
+        self.cancel_google_sign_in();
         let cookie = match cookie.as_deref().map(crate::auth::normalize_cookie) {
             Some(Ok(cookie)) => cookie,
             Some(Err(crate::auth::CookieProblem::MissingSapisid)) => {
@@ -3014,6 +3095,88 @@ impl Worker {
         self.restore_pending[CredentialSlot::Playback.index()] = false;
         self.emit(Event::Auth(AuthStatus::Connecting));
         self.on_web_signed_in(ApiSource::Personal, cookie);
+    }
+
+    /// Sign in with Google: ask Google for a code, open its page in the
+    /// browser for the listener to confirm, and wait for the token. Nothing
+    /// is stored until the token has been verified like a cookie.
+    fn sign_in_google(&mut self, client: crate::auth::OAuthClient) {
+        if client.id.trim().is_empty() || client.secret.trim().is_empty() {
+            self.emit(Event::Auth(AuthStatus::Refused(
+                SignInProblem::MissingOAuthClient,
+            )));
+            return;
+        }
+        self.cancel_google_sign_in();
+        self.credentials.invalidate(CredentialSlot::Playback);
+        self.restore_pending[CredentialSlot::Playback.index()] = false;
+        self.authorization_attempt += 1;
+        let attempt = self.authorization_attempt;
+        let (cancel, cancelled) = watch::channel(false);
+        self.google_sign_in = Some(cancel);
+        self.emit(Event::Auth(AuthStatus::Connecting));
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let http = ytmapi_rs::Client::new()
+                    .map_err(|error| crate::auth::OAuthProblem::Network(error.to_string()))?;
+                let code = crate::auth::start_google_sign_in(&http, &client).await?;
+                let _ = commands.send(Command::GoogleCodeShown {
+                    attempt,
+                    user_code: code.user_code.clone(),
+                    url: code.url.clone(),
+                });
+                crate::auth::wait_for_google_sign_in(&http, &code, &client, cancelled)
+                    .await
+                    .map(|token| crate::auth::encode_oauth_token(&token))
+            }
+            .await;
+            let _ = commands.send(Command::GoogleSignInEnded { attempt, result });
+        });
+    }
+
+    fn cancel_google_sign_in(&mut self) {
+        if let Some(cancel) = self.google_sign_in.take() {
+            let _ = cancel.send(true);
+        }
+    }
+
+    fn on_google_code(&mut self, attempt: u64, user_code: String, url: String) {
+        if attempt != self.authorization_attempt || self.google_sign_in.is_none() {
+            return;
+        }
+        self.emit(Event::Auth(AuthStatus::WaitingForGoogle {
+            user_code,
+            url: url.clone(),
+        }));
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = crate::opener::open(&url) {
+                log::warn!("unable to open the Google sign-in page: {error}");
+            }
+        });
+    }
+
+    fn on_google_sign_in_ended(
+        &mut self,
+        attempt: u64,
+        result: Result<String, crate::auth::OAuthProblem>,
+    ) {
+        if attempt != self.authorization_attempt || self.google_sign_in.take().is_none() {
+            return;
+        }
+        match result {
+            Ok(token) => {
+                self.emit(Event::Auth(AuthStatus::Connecting));
+                self.on_web_signed_in(ApiSource::Personal, token);
+            }
+            Err(crate::auth::OAuthProblem::Cancelled) => {}
+            Err(problem) => {
+                self.emit(Event::Auth(match SignInProblem::from_oauth(&problem) {
+                    Some(refused) => AuthStatus::Refused(refused),
+                    None => AuthStatus::Failed(format!("Google sign-in failed: {problem}")),
+                }));
+            }
+        }
     }
 
     fn delete_stored_grant(&self, slot: CredentialSlot) {
@@ -3041,6 +3204,7 @@ impl Worker {
         self.friend_names = Arc::default();
         self.connect = Arc::default();
         self.authorization_attempt += 1;
+        self.cancel_google_sign_in();
         if let Err(error) = self.credentials.revoke_spotify() {
             self.emit(Event::Error(error.to_string()));
         }
@@ -7506,6 +7670,95 @@ mod authorization_tests {
             worker.api.state(ApiSource::Personal),
             SessionState::Authorizing
         );
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Auth(AuthStatus::Connecting)))
+        );
+    }
+
+    const OAUTH_TOKEN: &str = r#"{"token_type":"Bearer","access_token":"dummy-access","refresh_token":"dummy-refresh","expires_in":3599,"request_time":{"secs_since_epoch":1700000000,"nanos_since_epoch":0},"client_id":"dummy-id","client_secret":"dummy-secret"}"#;
+
+    /// Sign in with Google needs the listener's OAuth client; the token it
+    /// ends with is verified like a cookie, and a refusal is explained on
+    /// the sign-in screen. Only the current attempt counts.
+    #[test]
+    fn google_sign_in_verifies_its_token_and_explains_refusals() {
+        let (runtime, mut worker, events) = worker("sign-in-with-google");
+        let _entered = runtime.enter();
+        worker.sign_in_google(crate::auth::OAuthClient {
+            id: "dummy-id".into(),
+            secret: " ".into(),
+        });
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            Event::Auth(AuthStatus::Refused(SignInProblem::MissingOAuthClient))
+        )));
+        assert_eq!(worker.authorization_attempt, 0);
+        assert!(worker.google_sign_in.is_none());
+
+        let waiting = |worker: &mut Worker| {
+            let (cancel, cancelled) = watch::channel(false);
+            worker.authorization_attempt += 1;
+            worker.google_sign_in = Some(cancel);
+            (worker.authorization_attempt, cancelled)
+        };
+        let (attempt, _cancelled) = waiting(&mut worker);
+        worker.on_google_sign_in_ended(attempt, Err(crate::auth::OAuthProblem::Denied));
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            Event::Auth(AuthStatus::Refused(SignInProblem::OAuthDenied))
+        )));
+        assert!(worker.google_sign_in.is_none());
+
+        let (attempt, cancelled) = waiting(&mut worker);
+        worker.cancel_google_sign_in();
+        assert!(*cancelled.borrow(), "cancel stops the wait for Google");
+        worker.on_google_sign_in_ended(attempt, Ok(OAUTH_TOKEN.into()));
+        assert!(
+            worker.authorizing_source.is_none(),
+            "a cancelled sign-in stays cancelled"
+        );
+
+        let (attempt, _cancelled) = waiting(&mut worker);
+        worker.on_google_sign_in_ended(attempt - 1, Ok(OAUTH_TOKEN.into()));
+        assert!(
+            worker.authorizing_source.is_none(),
+            "an older attempt is ignored"
+        );
+        worker.on_google_sign_in_ended(attempt, Ok(OAUTH_TOKEN.into()));
+        assert_eq!(worker.authorizing_source, Some(ApiSource::Personal));
+        assert_eq!(
+            worker.api.state(ApiSource::Personal),
+            SessionState::Authorizing
+        );
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Auth(AuthStatus::Connecting)))
+        );
+    }
+
+    /// A stored Google token signs in again on launch, as a cookie does.
+    #[test]
+    fn a_stored_google_token_restores_the_session() {
+        let (runtime, mut worker, events) = worker("restore-google");
+        let _entered = runtime.enter();
+        let lease = worker.credentials.lease(CredentialSlot::Playback);
+        worker.restore_pending[CredentialSlot::Playback.index()] = true;
+        worker.on_credentials_restored(
+            CredentialSlot::Playback,
+            lease,
+            Ok(crate::credentials::Loaded {
+                grant: Some(StoredGrant::Playback(Credentials::with_cookie(
+                    crate::auth::OAUTH_ACCOUNT,
+                    OAUTH_TOKEN,
+                ))),
+                warning: None,
+            }),
+        );
+        assert_eq!(worker.authorizing_source, Some(ApiSource::Personal));
+        assert!(worker.web_tokens[web_slot(ApiSource::Personal).index()].is_some());
         assert!(
             events
                 .try_iter()

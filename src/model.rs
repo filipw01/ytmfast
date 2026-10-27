@@ -1321,7 +1321,10 @@ pub enum Action {
     },
     ToggleShowAllTop(String),
     Reload(Page),
+    /// Sign in with Google with the OAuth client from Settings.
     SignIn,
+    /// Sign in with the cookie pasted on the sign-in screen.
+    SignInCookie,
     CancelSignIn,
     SignOut,
     /// Add, replace, or remove the optional personal Web API app.

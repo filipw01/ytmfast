@@ -103,6 +103,12 @@ pub struct RemoteSnapshot {
     pub received_at: Instant,
 }
 
+/// Which way the sign-in screen's button signs in.
+enum SignInWith {
+    Cookie,
+    Google(crate::auth::OAuthClient),
+}
+
 /// Keep the chosen volume until a poll sent after its write completes can
 /// replace it. A cached snapshot or an in-flight poll cannot confirm a write.
 struct PendingRemoteVolume {
@@ -640,10 +646,14 @@ pub struct App {
     last_eviction: Instant,
     /// Playback snapshot for the current frame, built once per redraw.
     frame_now: Option<NowPlaying>,
+    /// Google's page for the code Google sign-in is waiting on.
     pub sign_in_url: Option<String>,
     /// The cookie pasted on the sign-in screen. Never saved: it is handed to
     /// the backend on sign-in and the credential store keeps it from there.
     pub login_cookie: String,
+    /// The sign-in screen shows the advanced cookie sign-in instead of
+    /// Google's.
+    pub login_cookie_open: bool,
     /// The verified personal Web API application, when acceleration is ready.
     pub web_app: Option<String>,
     /// A shared grant from before 0.14.2 is signed in: Spotify can stop
@@ -1245,6 +1255,7 @@ impl App {
             frame_now: None,
             sign_in_url: None,
             login_cookie: String::new(),
+            login_cookie_open: false,
             web_app: None,
             shared_grant: false,
             pending_remote_position: None,
@@ -2801,6 +2812,7 @@ impl App {
             }
             // The sign-in screen explains it; a toast would say it twice.
             AuthStatus::Refused(_) => self.sign_in_url = None,
+            AuthStatus::WaitingForGoogle { url, .. } => self.sign_in_url = Some(url.clone()),
             _ => {}
         }
         self.auth = status;
@@ -4185,7 +4197,7 @@ impl App {
         }
     }
 
-    fn request_proxy(&mut self, sign_in: bool) {
+    fn request_proxy(&mut self, sign_in: Option<SignInWith>) {
         let config = match self.settings.proxy_config() {
             Ok(config) => config,
             Err(error) => {
@@ -4197,14 +4209,19 @@ impl App {
         let request = self.proxy_request;
         self.pending_proxy_preferences
             .insert(request, self.settings.proxy_preferences());
-        self.backend.send(if sign_in {
-            Command::SignIn {
+        self.backend.send(match sign_in {
+            Some(SignInWith::Cookie) => Command::SignIn {
                 request,
                 config,
                 cookie: Some(std::mem::take(&mut self.login_cookie)),
-            }
-        } else {
-            Command::ApplyProxy { request, config }
+            },
+            Some(SignInWith::Google(client)) => Command::SignInGoogle {
+                request,
+                config,
+                client_id: client.id,
+                client_secret: client.secret,
+            },
+            None => Command::ApplyProxy { request, config },
         });
     }
 
@@ -11651,10 +11668,15 @@ impl App {
                 }
             }
             Action::Reload(page) => self.reload(page),
-            Action::SignIn => {
-                self.request_proxy(true);
-            }
-            Action::ApplyProxy => self.request_proxy(false),
+            Action::SignIn => match self.settings.oauth_client() {
+                Some(client) => self.request_proxy(Some(SignInWith::Google(client))),
+                None => {
+                    self.auth =
+                        AuthStatus::Refused(crate::backend::SignInProblem::MissingOAuthClient)
+                }
+            },
+            Action::SignInCookie => self.request_proxy(Some(SignInWith::Cookie)),
+            Action::ApplyProxy => self.request_proxy(None),
             Action::ProxyEdited => self.proxy_form_edited = true,
             Action::CancelSignIn => {
                 self.backend.send(Command::CancelSignIn);
@@ -29638,7 +29660,7 @@ mod tests {
         );
         assert!(app.settings.proxy_password_legacy);
         app.settings.proxy_host = "other.example".into();
-        app.request_proxy(false);
+        app.request_proxy(None);
         app.handle_proxy_applied(
             app.proxy_request,
             app.settings.proxy_config().unwrap(),
@@ -29677,7 +29699,7 @@ mod tests {
             );
             assert_eq!(app.settings.proxy_password.is_empty(), edited);
             app.settings.proxy_mode = crate::settings::ProxyMode::Off;
-            app.request_proxy(false);
+            app.request_proxy(None);
             app.handle_proxy_applied(
                 app.proxy_request,
                 crate::settings::ProxyConfig::Off,
@@ -29699,7 +29721,7 @@ mod tests {
         app.backend.set_offline(true);
         let original = app.applied_proxy.clone();
         let failed = crate::settings::ProxyConfig::Invalid("Proxy port must be a number".into());
-        app.request_proxy(false);
+        app.request_proxy(None);
         app.handle_proxy_applied(
             app.proxy_request,
             failed,
@@ -29737,7 +29759,7 @@ mod tests {
             !app.dirs.proxy_secret_file().exists(),
             "never write a plaintext password beside settings"
         );
-        app.request_proxy(false);
+        app.request_proxy(None);
         let request = app.proxy_request;
         let accepted = app.settings.proxy_config().unwrap();
         // An acknowledgement for port 8080 arrives after another form edit.
@@ -29759,11 +29781,11 @@ mod tests {
         app.settings.proxy_mode = crate::settings::ProxyMode::Http;
         app.settings.proxy_host = "127.0.0.1".into();
         app.settings.proxy_port = "8080".into();
-        app.request_proxy(false);
+        app.request_proxy(None);
         let first = app.proxy_request;
         let old = app.settings.proxy_config().unwrap();
         app.settings.proxy_port = "8090".into();
-        app.request_proxy(false);
+        app.request_proxy(None);
         let newest = app.settings.proxy_config().unwrap();
         app.handle_proxy_applied(app.proxy_request, newest.clone(), Ok(false));
         app.handle_proxy_applied(first, old, Ok(false));

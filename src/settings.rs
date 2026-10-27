@@ -342,6 +342,16 @@ pub struct Settings {
     /// An optional personal Spotify Web API application id. The shared
     /// application remains active for coverage when this is present.
     pub web_client_id: Option<String>,
+    /// The Client ID of the listener's own Google Cloud OAuth client (type
+    /// "TVs and Limited Input devices") for Sign in with Google. Ytmfast
+    /// ships none. `YTMFAST_OAUTH_CLIENT_ID` is used when this is empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_client_id: Option<String>,
+    /// That client's secret. Google treats a limited-input client's secret
+    /// as not confidential, so it is kept here like a client ID.
+    /// `YTMFAST_OAUTH_CLIENT_SECRET` is used when this is empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_client_secret: Option<String>,
     /// Legacy reminder time, retained for older Ytmfast versions.
     pub personal_app_nudge_at: Option<String>,
     /// The listener has dismissed or followed the personal-app introduction.
@@ -470,6 +480,7 @@ impl std::fmt::Debug for Settings {
         let mut preferences = serde_json::to_value(self).map_err(|_| std::fmt::Error)?;
         if let Some(fields) = preferences.as_object_mut() {
             fields.remove("proxy_username");
+            fields.remove("oauth_client_secret");
         }
         f.debug_struct("Settings")
             .field("preferences", &preferences)
@@ -516,6 +527,8 @@ impl Default for Settings {
             search_history: Vec::new(),
             show_shortcut_hints: true,
             web_client_id: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
             personal_app_nudge_at: None,
             personal_app_intro_seen: false,
             slow_app_banner: SlowAppBanner::default(),
@@ -575,6 +588,15 @@ fn default_buffer_ms() -> u32 {
 }
 
 impl Settings {
+    /// The OAuth client Sign in with Google uses, from here or the
+    /// environment.
+    pub fn oauth_client(&self) -> Option<crate::auth::OAuthClient> {
+        crate::auth::oauth_credentials_from_env_or_settings(
+            self.oauth_client_id.as_deref(),
+            self.oauth_client_secret.as_deref(),
+        )
+    }
+
     /// The local files folder, when one is set.
     pub fn local_files_folder(&self) -> Option<std::path::PathBuf> {
         self.local_files_folder
@@ -1590,6 +1612,27 @@ mod tests {
         let debug = format!("{settings:?}");
         assert!(!debug.contains("private-proxy-user"));
         assert!(!debug.contains("private-proxy-password"));
+    }
+
+    #[test]
+    fn the_google_oauth_client_round_trips_and_its_secret_stays_out_of_debug() {
+        let settings = Settings {
+            oauth_client_id: Some("dummy-client.apps.googleusercontent.com".into()),
+            oauth_client_secret: Some("private-oauth-secret".into()),
+            ..Default::default()
+        };
+        assert!(!format!("{settings:?}").contains("private-oauth-secret"));
+        let text = serde_json::to_string(&settings).unwrap();
+        let restored: Settings = serde_json::from_str(&text).unwrap();
+        assert_eq!(restored.oauth_client_id, settings.oauth_client_id);
+        assert_eq!(restored.oauth_client_secret, settings.oauth_client_secret);
+        let older: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(older.oauth_client_id, None);
+        assert!(
+            !serde_json::to_string(&older)
+                .unwrap()
+                .contains("oauth_client")
+        );
     }
 
     #[test]

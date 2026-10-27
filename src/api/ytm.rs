@@ -3,21 +3,22 @@
 //!
 //! Search, browse and public playlists work without signing in. Library
 //! reads (the account's playlists, liked songs, followed artists, history)
-//! need the browser cookie from music.youtube.com; without one they answer
-//! with an empty page, not an error.
+//! need a Google OAuth token or the browser cookie from music.youtube.com;
+//! without either they answer with an empty page, not an error.
 //!
 //! Ids are YouTube Music's own: a video id for a song, a browse id for an
 //! album, a channel id for an artist and a playlist id for a playlist. URIs
 //! are `ytmusic:{kind}:{id}`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use tokio::sync::OnceCell;
 use ytmapi_rs::auth::noauth::NoAuthToken;
-use ytmapi_rs::auth::{AuthToken, BrowserToken};
+use ytmapi_rs::auth::{AuthToken, BrowserToken, OAuthToken};
 use ytmapi_rs::common::{
     AlbumID, AlbumType, ArtistChannelID, Explicit, LikeStatus, PlaylistID, Thumbnail, VideoID,
     YoutubeID,
@@ -37,8 +38,9 @@ use super::ApiSource;
 use super::client::{ApiError, Result};
 use super::models::*;
 
-/// The id every signed-in YouTube Music account has here. The cookie carries
-/// no account name the library can read, and one cookie is one account.
+/// The id every signed-in YouTube Music account has here. Neither the cookie
+/// nor the OAuth token carries an account name the library can read, and
+/// one sign-in is one account.
 pub const ACCOUNT_ID: &str = "ytmusic";
 
 /// How long a downloaded playlist, album or library list is reused, so
@@ -539,6 +541,9 @@ pub fn map_error(error: ytmapi_rs::Error, signed_in: bool, source: ApiSource) ->
             ApiError::Network(message)
         }
         ErrorKind::Io(error) => ApiError::Network(error.to_string()),
+        // Still expired after the refresh and retry: the clock moved, not
+        // the grant. The next call refreshes again.
+        ErrorKind::OAuthTokenExpired { .. } => ApiError::Network(message),
         ErrorKind::OtherErrorCodeInResponse {
             code: 401 | 403, ..
         } if signed_in => ApiError::SignInExpired { api_source: source },
@@ -599,24 +604,146 @@ impl<T> Cache<T> {
 enum Session<'a> {
     Anonymous(&'a YtMusic<NoAuthToken>),
     Cookie(&'a YtMusic<BrowserToken>),
+    /// Owned, so a refresh can replace the connection under calls still
+    /// using the one before it.
+    OAuth(Arc<YtMusic<OAuthToken>>),
 }
 
-/// Runs the same generic call on whichever session there is.
+/// Whether a call failed only because its OAuth token ran out between the
+/// check before it and the request, and is worth one more try.
+trait Retry {
+    fn token_expired(&self) -> bool;
+}
+
+fn is_token_expired(error: &ytmapi_rs::Error) -> bool {
+    // `ytmapi_rs::Error` offers its kind only by value.
+    error.to_string() == "OAuth token has expired"
+}
+
+impl<T> Retry for ytmapi_rs::Result<T> {
+    fn token_expired(&self) -> bool {
+        self.as_ref().err().is_some_and(is_token_expired)
+    }
+}
+
+impl<A, B, C, D> Retry
+    for (
+        Option<ytmapi_rs::Result<A>>,
+        Option<ytmapi_rs::Result<B>>,
+        Option<ytmapi_rs::Result<C>>,
+        Option<ytmapi_rs::Result<D>>,
+    )
+{
+    fn token_expired(&self) -> bool {
+        self.0.as_ref().is_some_and(Retry::token_expired)
+            || self.1.as_ref().is_some_and(Retry::token_expired)
+            || self.2.as_ref().is_some_and(Retry::token_expired)
+            || self.3.as_ref().is_some_and(Retry::token_expired)
+    }
+}
+
+/// Runs the same generic call on whichever session there is, once more
+/// after a refresh when an OAuth token ran out under it. `$body` may run
+/// twice, so it must not move what it uses.
 macro_rules! on_session {
-    ($self:expr, $yt:ident => $body:expr) => {
-        match $self.session().await? {
-            Session::Anonymous($yt) => $body,
-            Session::Cookie($yt) => $body,
+    ($self:expr, $yt:ident => $body:expr) => {{
+        let mut retried = false;
+        loop {
+            let outcome = match $self.session().await? {
+                Session::Anonymous($yt) => $body,
+                Session::Cookie($yt) => $body,
+                Session::OAuth(owned) => {
+                    let $yt: &YtMusic<OAuthToken> = &owned;
+                    $body
+                }
+            };
+            if !retried && Retry::token_expired(&outcome) {
+                retried = true;
+                $self.refresh_due();
+                continue;
+            }
+            break outcome;
         }
-    };
+    }};
 }
 
-/// One YouTube Music connection: unauthenticated, or with a cookie.
+/// `on_session!` for what only a signed-in account can do.
+macro_rules! on_account {
+    ($self:expr, $yt:ident => $body:expr) => {{
+        let mut retried = false;
+        loop {
+            let outcome = match $self.session().await? {
+                Session::Anonymous(_) => return Err(ApiError::NotSignedIn),
+                Session::Cookie($yt) => $body,
+                Session::OAuth(owned) => {
+                    let $yt: &YtMusic<OAuthToken> = &owned;
+                    $body
+                }
+            };
+            if !retried && Retry::token_expired(&outcome) {
+                retried = true;
+                $self.refresh_due();
+                continue;
+            }
+            break outcome;
+        }
+    }};
+}
+
+/// Refresh this long before Google's expiry, ahead of the minute
+/// `ytmapi-rs` itself refuses to use a token in.
+const REFRESH_AHEAD_SECS: u64 = 120;
+
+/// What a connection signs in with.
+enum Credential {
+    None,
+    Cookie(String),
+    OAuth(OAuthToken),
+    /// A stored token that does not read back: every account call is
+    /// refused as an expired sign-in.
+    Unreadable,
+}
+
+/// The live OAuth connection and the token it uses.
+struct OAuthSession {
+    client: Client,
+    token: OAuthToken,
+    expires_at: Option<u64>,
+    yt: Arc<YtMusic<OAuthToken>>,
+}
+
+impl OAuthSession {
+    fn new(client: Client, token: OAuthToken) -> ytmapi_rs::Result<Self> {
+        let yt = YtMusicBuilder::new_with_client(client.clone())
+            .with_auth_token(token.clone())
+            .build()?;
+        Ok(Self {
+            expires_at: crate::auth::oauth_expires_at(&token),
+            client,
+            token,
+            yt: Arc::new(yt),
+        })
+    }
+
+    fn due(&self) -> bool {
+        self.expires_at
+            .is_some_and(|at| crate::auth::unix_now() + REFRESH_AHEAD_SECS >= at)
+    }
+}
+
+/// Told the refreshed token, to keep it in the credential store.
+pub type OnRefresh = Arc<dyn Fn(String) + Send + Sync>;
+
+/// One YouTube Music connection: unauthenticated, with a cookie, or with a
+/// Google OAuth token.
 pub struct Ytm {
-    cookie: Option<String>,
+    auth: Credential,
     source: ApiSource,
     anonymous: OnceCell<YtMusic<NoAuthToken>>,
     signed_in: OnceCell<YtMusic<BrowserToken>>,
+    oauth: tokio::sync::Mutex<Option<OAuthSession>>,
+    refresh_due: AtomicBool,
+    on_refresh: Option<OnRefresh>,
     playlists: Cache<Vec<YtPlaylistItem>>,
     library: Cache<Vec<Playlist>>,
     albums: Cache<Album>,
@@ -624,12 +751,22 @@ pub struct Ytm {
 }
 
 impl Ytm {
-    pub fn new(cookie: Option<String>, source: ApiSource) -> Self {
+    /// `auth` is a cookie, or an OAuth token as JSON (it starts with `{`).
+    pub fn new(auth: Option<String>, source: ApiSource) -> Self {
+        let auth = match auth.as_deref().map(str::trim) {
+            None | Some("") => Credential::None,
+            Some(text) if crate::auth::is_oauth_blob(text) => crate::auth::decode_oauth_token(text)
+                .map_or(Credential::Unreadable, Credential::OAuth),
+            Some(text) => Credential::Cookie(text.to_string()),
+        };
         Self {
-            cookie: cookie.filter(|cookie| !cookie.trim().is_empty()),
+            auth,
             source,
             anonymous: OnceCell::new(),
             signed_in: OnceCell::new(),
+            oauth: tokio::sync::Mutex::new(None),
+            refresh_due: AtomicBool::new(false),
+            on_refresh: None,
             playlists: Cache::default(),
             library: Cache::default(),
             albums: Cache::default(),
@@ -637,18 +774,33 @@ impl Ytm {
         }
     }
 
-    pub fn has_cookie(&self) -> bool {
-        self.cookie.is_some()
+    /// Calls `on_refresh` with each token a refresh brings.
+    pub fn with_on_refresh(mut self, on_refresh: OnRefresh) -> Self {
+        self.on_refresh = Some(on_refresh);
+        self
+    }
+
+    /// Whether this connection has a cookie or a token to sign in with.
+    pub fn is_signed_in(&self) -> bool {
+        !matches!(self.auth, Credential::None)
     }
 
     fn error(&self, error: ytmapi_rs::Error) -> ApiError {
-        map_error(error, self.cookie.is_some(), self.source)
+        map_error(error, self.is_signed_in(), self.source)
+    }
+
+    fn refresh_due(&self) {
+        self.refresh_due.store(true, Ordering::SeqCst);
     }
 
     async fn session(&self) -> Result<Session<'_>> {
-        match &self.cookie {
-            Some(_) => self.cookie_session().await.map(Session::Cookie),
-            None => {
+        match &self.auth {
+            Credential::Cookie(_) => self.cookie_session().await.map(Session::Cookie),
+            Credential::OAuth(token) => self.oauth_session(token).await.map(Session::OAuth),
+            Credential::Unreadable => Err(ApiError::SignInExpired {
+                api_source: self.source,
+            }),
+            Credential::None => {
                 let yt = self
                     .anonymous
                     .get_or_try_init(|| async {
@@ -663,7 +815,10 @@ impl Ytm {
     }
 
     async fn cookie_session(&self) -> Result<&YtMusic<BrowserToken>> {
-        let cookie = self.cookie.clone().ok_or(ApiError::NotSignedIn)?;
+        let Credential::Cookie(cookie) = &self.auth else {
+            return Err(ApiError::NotSignedIn);
+        };
+        let cookie = cookie.clone();
         self.signed_in
             .get_or_try_init(|| async {
                 let client = Client::new()?;
@@ -676,21 +831,60 @@ impl Ytm {
             .map_err(|error| self.error(error))
     }
 
-    /// Checks the cookie by reading the library with it. An unauthenticated
-    /// connection has nothing to check.
-    pub async fn verify(&self) -> Result<User> {
-        if self.cookie.is_some() {
-            let yt = self.cookie_session().await?;
-            if let Err(error) = yt.get_library_playlists().await {
-                return Err(match self.error(error) {
-                    // A cookie YouTube no longer accepts gets a page the
-                    // library reader cannot make sense of.
-                    ApiError::Decode(_) => ApiError::SignInExpired {
-                        api_source: self.source,
-                    },
-                    other => other,
-                });
+    /// The OAuth connection, refreshed first when its token is about to
+    /// run out or a call found it had.
+    async fn oauth_session(&self, initial: &OAuthToken) -> Result<Arc<YtMusic<OAuthToken>>> {
+        let mut live = self.oauth.lock().await;
+        if live.is_none() {
+            let client = Client::new().map_err(|error| self.error(error))?;
+            *live = Some(
+                OAuthSession::new(client, initial.clone()).map_err(|error| self.error(error))?,
+            );
+        }
+        let Some(session) = live.as_mut() else {
+            return Err(ApiError::NotSignedIn);
+        };
+        if session.due() || self.refresh_due.swap(false, Ordering::SeqCst) {
+            let token = session
+                .token
+                .refresh(&session.client)
+                .await
+                .map_err(|error| self.refresh_error(error))?;
+            *session = OAuthSession::new(session.client.clone(), token)
+                .map_err(|error| self.error(error))?;
+            if let Some(on_refresh) = &self.on_refresh {
+                on_refresh(crate::auth::encode_oauth_token(&session.token));
             }
+        }
+        Ok(Arc::clone(&session.yt))
+    }
+
+    /// A refresh that reached Google and was refused means the grant was
+    /// revoked: the listener signs in again.
+    fn refresh_error(&self, error: ytmapi_rs::Error) -> ApiError {
+        match error.into_kind() {
+            ErrorKind::Web { message } => ApiError::Network(message),
+            ErrorKind::Io(error) => ApiError::Network(error.to_string()),
+            _ => ApiError::SignInExpired {
+                api_source: self.source,
+            },
+        }
+    }
+
+    /// Checks the cookie or token by reading the library with it. An
+    /// unauthenticated connection has nothing to check.
+    pub async fn verify(&self) -> Result<User> {
+        if self.is_signed_in()
+            && let Err(error) = on_account!(self, yt => yt.get_library_playlists().await)
+        {
+            return Err(match self.error(error) {
+                // A cookie YouTube no longer accepts gets a page the
+                // library reader cannot make sense of.
+                ApiError::Decode(_) => ApiError::SignInExpired {
+                    api_source: self.source,
+                },
+                other => other,
+            });
         }
         Ok(User {
             id: ACCOUNT_ID.into(),
@@ -828,7 +1022,7 @@ impl Ytm {
     /// Without a cookie, what needs one is empty, not a failure.
     fn or_empty<T: Default>(&self, result: Result<T>) -> Result<T> {
         match result {
-            Err(error) if !self.has_cookie() && !error.is_network() => Ok(T::default()),
+            Err(error) if !self.is_signed_in() && !error.is_network() => Ok(T::default()),
             other => other,
         }
     }
@@ -870,7 +1064,7 @@ impl Ytm {
 
     async fn watch(&self, video_id: &str) -> Result<Vec<WatchPlaylistTrack>> {
         let id = VideoID::from_raw(video_id.to_string());
-        on_session!(self, yt => yt.get_watch_playlist_from_video_id(id).await)
+        on_session!(self, yt => yt.get_watch_playlist_from_video_id(id.clone()).await)
             .map_err(|error| self.error(error))
     }
 
@@ -897,7 +1091,8 @@ impl Ytm {
 
     async fn artist_page(&self, id: &str) -> Result<GetArtist> {
         let query = ArtistChannelID::from_raw(id.to_string());
-        on_session!(self, yt => yt.get_artist(query).await).map_err(|error| self.error(error))
+        on_session!(self, yt => yt.get_artist(query.clone()).await)
+            .map_err(|error| self.error(error))
     }
 
     pub async fn artist(&self, id: &str) -> Result<Artist> {
@@ -959,7 +1154,7 @@ impl Ytm {
             let full = match (&shelf.browse_id, &shelf.params) {
                 (Some(channel), Some(params)) => {
                     let (channel, params) = (channel.clone(), params.clone());
-                    on_session!(self, yt => yt.get_artist_albums(channel, params).await).ok()
+                    on_session!(self, yt => yt.get_artist_albums(channel.clone(), params.clone()).await).ok()
                 }
                 _ => None,
             };
@@ -993,7 +1188,7 @@ impl Ytm {
 
     pub async fn playlist(&self, id: &str) -> Result<Playlist> {
         let query = PlaylistID::from_raw(browse_id(id));
-        let details = on_session!(self, yt => yt.get_playlist_details(query).await)
+        let details = on_session!(self, yt => yt.get_playlist_details(query.clone()).await)
             .map_err(|error| self.error(error));
         self.or_empty(details.map(|details| playlist_details(&details)))
             .map(|mut playlist| {
@@ -1011,7 +1206,7 @@ impl Ytm {
             return Ok(items);
         }
         let browse = browse_id(id);
-        let items = on_session!(self, yt => collect_playlist(yt, browse).await)
+        let items = on_session!(self, yt => collect_playlist(yt, browse.clone()).await)
             .map_err(|error| self.error(error))?;
         Ok(self.playlists.put(id, items))
     }
@@ -1030,17 +1225,13 @@ impl Ytm {
     }
 
     pub async fn my_playlists(&self, offset: u32, limit: u32) -> Result<Page<Playlist>> {
-        if !self.has_cookie() {
+        if !self.is_signed_in() {
             return Ok(Page::default());
         }
         let playlists = match self.library.get("playlists") {
             Some(playlists) => playlists,
             None => {
-                let listed = self
-                    .cookie_session()
-                    .await?
-                    .get_library_playlists()
-                    .await
+                let listed = on_account!(self, yt => yt.get_library_playlists().await)
                     .map_err(|error| self.error(error))?;
                 let mapped = listed.iter().map(library_playlist).collect();
                 self.library.put("playlists", mapped)
@@ -1052,7 +1243,7 @@ impl Ytm {
     // ---- the account's library ---------------------------------------------------------
 
     async fn liked_all(&self) -> Result<Arc<Vec<PlaylistItem>>> {
-        if !self.has_cookie() {
+        if !self.is_signed_in() {
             return Ok(Arc::default());
         }
         if let Some(liked) = self.liked.get(LIKED_PLAYLIST) {
@@ -1080,14 +1271,10 @@ impl Ytm {
     }
 
     pub async fn saved_albums(&self, offset: u32, limit: u32) -> Result<Page<SavedAlbum>> {
-        if !self.has_cookie() {
+        if !self.is_signed_in() {
             return Ok(Page::default());
         }
-        let albums = self
-            .cookie_session()
-            .await?
-            .get_library_albums()
-            .await
+        let albums = on_account!(self, yt => yt.get_library_albums().await)
             .map_err(|error| self.error(error))?;
         let albums = albums
             .iter()
@@ -1100,14 +1287,10 @@ impl Ytm {
     }
 
     pub async fn followed_artists(&self) -> Result<CursorPage<Artist>> {
-        if !self.has_cookie() {
+        if !self.is_signed_in() {
             return Ok(CursorPage::default());
         }
-        let artists = self
-            .cookie_session()
-            .await?
-            .get_library_artist_subscriptions()
-            .await
+        let artists = on_account!(self, yt => yt.get_library_artist_subscriptions().await)
             .map_err(|error| self.error(error))?;
         let items: Vec<Artist> = artists.iter().map(subscription_artist).collect();
         Ok(CursorPage {
@@ -1119,15 +1302,11 @@ impl Ytm {
     }
 
     pub async fn recently_played(&self, limit: u32) -> Result<CursorPage<PlayHistory>> {
-        if !self.has_cookie() {
+        if !self.is_signed_in() {
             return Ok(CursorPage::default());
         }
-        let history = self
-            .cookie_session()
-            .await?
-            .get_history()
-            .await
-            .map_err(|error| self.error(error))?;
+        let history =
+            on_account!(self, yt => yt.get_history().await).map_err(|error| self.error(error))?;
         let items = history
             .iter()
             .flat_map(|period| period.items.iter())
@@ -1147,7 +1326,7 @@ impl Ytm {
 
     /// Whether each URI is liked, saved, or followed, in the order given.
     pub async fn contains(&self, uris: &[String]) -> Result<Vec<bool>> {
-        if !self.has_cookie() {
+        if !self.is_signed_in() {
             return Ok(vec![false; uris.len()]);
         }
         let mut out = Vec::with_capacity(uris.len());
@@ -1181,7 +1360,9 @@ impl Ytm {
 
     /// Likes songs, saves playlists and albums, and follows artists.
     pub async fn set_saved(&self, uris: &[String], saved: bool) -> Result<()> {
-        let yt = self.cookie_session().await?;
+        if !self.is_signed_in() {
+            return Err(ApiError::NotSignedIn);
+        }
         let rating = if saved {
             LikeStatus::Liked
         } else {
@@ -1192,35 +1373,35 @@ impl Ytm {
                 continue;
             };
             let outcome = match kind {
-                "track" => {
+                "track" => on_account!(self, yt => {
                     yt.rate_song(VideoID::from_raw(id.to_string()), rating.clone())
                         .await
-                }
-                "playlist" => {
+                }),
+                "playlist" => on_account!(self, yt => {
                     yt.rate_playlist(
                         PlaylistID::from_raw(playlist_id(id).to_string()),
                         rating.clone(),
                     )
                     .await
-                }
+                }),
                 "album" => {
-                    let details = yt
-                        .get_album(AlbumID::from_raw(id.to_string()))
-                        .await
-                        .map_err(|error| self.error(error))?;
-                    match details.audio_playlist_id {
-                        Some(playlist) => yt.rate_playlist(playlist, rating.clone()).await,
-                        None => continue,
-                    }
+                    let details = on_account!(self, yt => {
+                        yt.get_album(AlbumID::from_raw(id.to_string())).await
+                    })
+                    .map_err(|error| self.error(error))?;
+                    let Some(playlist) = details.audio_playlist_id else {
+                        continue;
+                    };
+                    on_account!(self, yt => yt.rate_playlist(playlist.clone(), rating.clone()).await)
                 }
-                "artist" => {
+                "artist" => on_account!(self, yt => {
                     let channel = ArtistChannelID::from_raw(id.to_string());
                     if saved {
                         yt.subscribe_artist(channel).await
                     } else {
                         yt.unsubscribe_artists([channel]).await
                     }
-                }
+                }),
                 _ => continue,
             };
             outcome.map_err(|error| self.error(error))?;

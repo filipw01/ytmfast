@@ -55,7 +55,8 @@ struct Cli {
     /// `windows-taskbar`, `start-in-tray`, `german`, `lyrics`, `lyrics-fullscreen`, `collection-loading`,
     /// `shuffle-selected`, `shuffle-started`, `undated-mix`, `signed-out`, `connecting`, `library-list`,
     /// `library-list-narrow`, `library-list-wide`, `library-grid`, `library-grid-narrow`,
-    /// `library-grid-wide`, `sign-in-returning`, `sign-in-malformed`,
+    /// `library-grid-wide`, `sign-in-returning`, `sign-in-google-waiting`,
+    /// `sign-in-cookie`, `sign-in-malformed`,
     /// `sign-in-missing-sapisid`, `sign-in-expired`,
     /// `shared-grant`, or `own-app`.
     #[cfg(feature = "demo")]

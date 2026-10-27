@@ -64,7 +64,8 @@ impl From<reqwest::Error> for ApiError {
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
-/// Where a request's credentials come from: the YouTube Music cookie.
+/// Where a request's credentials come from: the YouTube Music cookie or
+/// Google OAuth token.
 #[derive(Clone)]
 pub enum TokenProvider {
     Cookie(Arc<CookieSession>),
@@ -78,11 +79,15 @@ impl TokenProvider {
     }
 }
 
-/// The signed-in browser cookie, kept in memory until the account it opens
-/// has been verified and only then written to the protected credential store
-/// as the account's playback credential. It has no `Debug`: it is a secret.
+/// The signed-in browser cookie or Google OAuth token (as JSON), kept in
+/// memory until the account it opens has been verified and only then written
+/// to the protected credential store as the account's playback credential.
+/// It has no `Debug`: it is a secret.
 pub struct CookieSession {
-    cookie: String,
+    cookie: Mutex<String>,
+    /// The verified account, once `remember` stored the credential: a
+    /// refreshed OAuth token is stored for it from then on.
+    remembered: Mutex<Option<String>>,
     lease: crate::credentials::Lease,
     storage_error: Arc<dyn Fn(crate::credentials::Error) + Send + Sync>,
     source: ApiSource,
@@ -96,26 +101,35 @@ impl CookieSession {
         storage_error: Arc<dyn Fn(crate::credentials::Error) + Send + Sync>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            cookie,
+            cookie: Mutex::new(cookie),
+            remembered: Mutex::new(None),
             lease,
             storage_error,
             source,
         })
     }
 
-    /// The cookie, unless this sign-in was replaced or signed out meanwhile.
+    fn current(&self) -> String {
+        self.cookie
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// The cookie or token, unless this sign-in was replaced or signed out
+    /// meanwhile.
     fn cookie(&self) -> Result<String> {
         if !self.lease.current() {
             return Err(ApiError::SignInExpired {
                 api_source: self.source,
             });
         }
-        Ok(self.cookie.clone())
+        Ok(self.current())
     }
 
     /// The credential the local engine signs in with for `account`.
     pub fn credentials(&self, account: &str) -> crate::player::Credentials {
-        crate::player::Credentials::with_cookie(account, self.cookie.clone())
+        crate::player::Credentials::with_cookie(account, self.current())
     }
 
     /// Starts persistence only after the account has been verified.
@@ -123,6 +137,7 @@ impl CookieSession {
         &self,
         account: &str,
     ) -> std::result::Result<(), crate::credentials::Error> {
+        *self.remembered.lock().unwrap_or_else(|p| p.into_inner()) = Some(account.to_string());
         let pending = self.lease.save(crate::credentials::Grant::Playback(
             self.credentials(account),
         ));
@@ -131,6 +146,32 @@ impl CookieSession {
             (self.storage_error)(*error);
         }
         result
+    }
+
+    /// Keeps a refreshed OAuth token: in memory for the next connection, and
+    /// in the credential store once the account was verified.
+    pub fn refreshed(&self, token: String) {
+        if !self.lease.current() || !crate::auth::is_oauth_blob(&token) {
+            return;
+        }
+        *self.cookie.lock().unwrap_or_else(|p| p.into_inner()) = token;
+        let account = self
+            .remembered
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(account) = account else {
+            return;
+        };
+        let pending = self.lease.save(crate::credentials::Grant::Playback(
+            self.credentials(&account),
+        ));
+        let storage_error = Arc::clone(&self.storage_error);
+        tokio::spawn(async move {
+            if let Err(error) = pending.await {
+                storage_error(error);
+            }
+        });
     }
 }
 
@@ -307,8 +348,12 @@ impl ApiClient {
         let cookie = provider
             .as_ref()
             .and_then(|provider| provider.cookie().ok());
-        *self.ytm.lock().unwrap_or_else(|p| p.into_inner()) =
-            Arc::new(Ytm::new(cookie, self.source));
+        let mut ytm = Ytm::new(cookie, self.source);
+        if let Some(TokenProvider::Cookie(session)) = &provider {
+            let session = Arc::clone(session);
+            ytm = ytm.with_on_refresh(Arc::new(move |token| session.refreshed(token)));
+        }
+        *self.ytm.lock().unwrap_or_else(|p| p.into_inner()) = Arc::new(ytm);
         *self.tokens.lock().unwrap_or_else(|p| p.into_inner()) = provider;
     }
 
