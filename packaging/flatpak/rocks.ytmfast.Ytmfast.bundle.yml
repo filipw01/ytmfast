@@ -1,0 +1,37 @@
+# The release workflow's Flatpak: the binary the Linux job built, packaged
+# into the same sandbox as rocks.ytmfast.Ytmfast.yml describes. The
+# job unpacks the release tarball into built/ beside this file first.
+id: rocks.ytmfast.Ytmfast
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+command: ytmfast
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  - --socket=pulseaudio
+  - --share=network
+  # Platform storage for this application's Spotify grants.
+  - --talk-name=org.freedesktop.secrets
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --own-name=org.mpris.MediaPlayer2.ytmfast
+  - --persist=.local/state
+modules:
+  - name: ytmfast
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 ytmfast /app/bin/ytmfast
+      - install -Dm644 packaging/applications/*.desktop /app/share/applications/rocks.ytmfast.Ytmfast.desktop
+      - sed -i 's/^Icon=.*$/Icon=rocks.ytmfast.Ytmfast/;s/^StartupWMClass=ytmfast$/StartupWMClass=rocks.ytmfast.Ytmfast/' /app/share/applications/rocks.ytmfast.Ytmfast.desktop
+      - install -Dm644 packaging/icons/*.svg /app/share/icons/hicolor/scalable/apps/rocks.ytmfast.Ytmfast.svg
+      - install -Dm644 packaging/flatpak/rocks.ytmfast.Ytmfast.metainfo.xml /app/share/metainfo/rocks.ytmfast.Ytmfast.metainfo.xml
+      - install -Dm644 LICENSE /app/share/licenses/ytmfast/LICENSE
+    sources:
+      - type: dir
+        path: built
+      # Metainfo belongs to this packaging checkout, not the portable archive.
+      - type: file
+        path: rocks.ytmfast.Ytmfast.metainfo.xml
+        dest: packaging/flatpak

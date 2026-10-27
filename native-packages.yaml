@@ -1,0 +1,258 @@
+# Shared CLI: gem install native-packages --version 0.11.0
+---
+schema: 1
+tool:
+  version: 0.11.0
+  nfpm: 2.47.0
+# Ubuntu 24.04 and Debian 13 use the ALSA t64 package name. Override ELF
+# inference as well as the explicit dependencies below.
+libraries:
+  libasound.so.2:
+    deb: libasound2t64
+    rpm: alsa-lib
+  libpipewire-0.3.so.0:
+    deb: libpipewire-0.3-0t64 | libpipewire-0.3-0
+    rpm: pipewire-libs
+nfpm:
+  name: ytmfast
+  maintainer: Carmine Paolino <carmine@paolino.me>
+  homepage: https://github.com/crmne/ytmfast
+  description: A native Spotify client
+  license: MIT
+  contents:
+  # A glob source makes nFPM append its basename to the destination directory.
+  - src: "@PAYLOAD@/*-v@VERSION@-@TARGET@/ytmfast"
+    dst: "/usr/bin/"
+    file_info:
+      mode: 493
+  - src: "@PAYLOAD@/*-v@VERSION@-@TARGET@/LICENSE"
+    dst: "/usr/share/licenses/ytmfast/"
+    file_info:
+      mode: 420
+  - src: "@PAYLOAD@/*-v@VERSION@-@TARGET@/README.md"
+    dst: "/usr/share/doc/ytmfast/"
+    file_info:
+      mode: 420
+  - src: "@PAYLOAD@/*-v@VERSION@-@TARGET@/packaging/applications/*.desktop"
+    dst: "/usr/share/applications/"
+    file_info:
+      mode: 420
+  - src: "@PAYLOAD@/*-v@VERSION@-@TARGET@/packaging/icons/*.svg"
+    dst: "/usr/share/icons/hicolor/scalable/apps/"
+    file_info:
+      mode: 420
+  - src: contrib/omarchy/ytmfast.json.tpl
+    dst: /usr/share/ytmfast/omarchy/ytmfast.json.tpl
+    file_info:
+      mode: 420
+  - src: contrib/omarchy/ytmfast-theme
+    dst: /usr/share/ytmfast/omarchy/ytmfast-theme
+    file_info:
+      mode: 493
+  overrides:
+    # ELF inspection cannot discover the GUI's dlopen dependencies. Keep
+    # these aligned with winit/glutin/rfd and packaging/check-runtime-libs.c.
+    deb:
+      depends:
+      - libdbus-1-3
+      - libc6 (>= 2.39)
+      - libgl1
+      - libegl1
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libwayland-client0
+      - libwayland-cursor0
+      - libwayland-egl1
+      - libx11-6
+      - libx11-xcb1
+      - libxcursor1
+      - libxi6
+      - libxrandr2
+      - libasound2t64
+      - libpipewire-0.3-0t64 | libpipewire-0.3-0
+      - libgcc-s1
+      - libstdc++6
+    rpm:
+      depends:
+      - dbus-libs
+      - glibc >= 2.39
+      - libglvnd-glx
+      - libglvnd-egl
+      - libxkbcommon
+      - libxkbcommon-x11
+      - libwayland-client
+      - libwayland-cursor
+      - libwayland-egl
+      - libX11
+      - libX11-xcb
+      - libXcursor
+      - libXi
+      - libXrandr
+      - alsa-lib
+      - pipewire-libs
+      - libgcc
+      - libstdc++
+  rpm:
+    buildhost: github-actions
+# Windows code and installers are signed through Azure Artifact Signing as
+# PlentyLabs when the windows-signing environment provides the account
+# (PACKAGING.md, "Windows signing").
+windows:
+  signing:
+    provider: azure-artifact-signing
+    description: Ytmfast
+    publisher: PlentyLabs UG (haftungsbeschränkt) & Co. KG
+targets:
+  macos-universal:
+    platform: macos
+    arch: universal
+    formats: [dmg]
+    input:
+      kind: directory
+      local: dist/macos-input
+    native:
+      command: [ruby, packaging/macos/dmg.rb, '@PAYLOAD@', '@PACKAGE@']
+      output: 'ytmfast-@TAG@-macos-universal.dmg'
+  linux-amd64:
+    platform: linux
+    arch: amd64
+    libc: glibc
+    compiler_target: x86_64-unknown-linux-gnu
+    formats:
+    - deb
+    - rpm
+    input:
+      local: dist/ytmfast-v@VERSION@-x86_64-unknown-linux-gnu.tar.gz
+      release_asset: ytmfast-v@VERSION@-x86_64-unknown-linux-gnu.tar.gz
+  linux-arm64:
+    platform: linux
+    arch: arm64
+    libc: glibc
+    compiler_target: aarch64-unknown-linux-gnu
+    formats:
+    - deb
+    - rpm
+    input:
+      local: dist/ytmfast-v@VERSION@-aarch64-unknown-linux-gnu.tar.gz
+      release_asset: ytmfast-v@VERSION@-aarch64-unknown-linux-gnu.tar.gz
+  # The AppImages come from the release's Linux build jobs, before the
+  # release is published, so checksums.txt lists them and its signature
+  # covers them: the app replaces an AppImage only with a signed one. The
+  # update information points AppImageUpdate and the updaters built on it
+  # at the newest stable release's .zsync file for the same architecture.
+  appimage-amd64:
+    platform: linux
+    arch: amd64
+    libc: glibc
+    compiler_target: x86_64-unknown-linux-gnu
+    formats: [appimage]
+    appimage:
+      update_information: gh-releases-zsync|crmne|ytmfast|latest|ytmfast-*-x86_64.AppImage.zsync
+    input:
+      local: dist/ytmfast-v@VERSION@-x86_64-unknown-linux-gnu.tar.gz
+      release_asset: ytmfast-v@VERSION@-x86_64-unknown-linux-gnu.tar.gz
+  appimage-arm64:
+    platform: linux
+    arch: arm64
+    libc: glibc
+    compiler_target: aarch64-unknown-linux-gnu
+    formats: [appimage]
+    appimage:
+      update_information: gh-releases-zsync|crmne|ytmfast|latest|ytmfast-*-aarch64.AppImage.zsync
+    input:
+      local: dist/ytmfast-v@VERSION@-aarch64-unknown-linux-gnu.tar.gz
+      release_asset: ytmfast-v@VERSION@-aarch64-unknown-linux-gnu.tar.gz
+  # Windows Installer packages, built on each Windows release runner from the
+  # binary it built; the input folder holds what the package installs.
+  windows-amd64:
+    platform: windows
+    arch: amd64
+    compiler_target: x86_64-pc-windows-msvc
+    formats: [msi]
+    input:
+      kind: directory
+      local: dist/msi-input-x86_64-pc-windows-msvc
+    native:
+      command: [python, packaging/windows/build-msi.py, '@PAYLOAD@', '@PACKAGE@', '@VERSION@', '@ARCH@']
+      output: 'ytmfast-@TAG@-@TARGET@.msi'
+  windows-arm64:
+    platform: windows
+    arch: arm64
+    compiler_target: aarch64-pc-windows-msvc
+    formats: [msi]
+    input:
+      kind: directory
+      local: dist/msi-input-aarch64-pc-windows-msvc
+    native:
+      command: [python, packaging/windows/build-msi.py, '@PAYLOAD@', '@PACKAGE@', '@VERSION@', '@ARCH@']
+      output: 'ytmfast-@TAG@-@TARGET@.msi'
+release:
+  repository: crmne/ytmfast
+  prereleases: true
+  checksums: checksums.txt
+assets:
+  AMD64:
+    file: ytmfast-v@VERSION@-x86_64-unknown-linux-gnu.tar.gz
+    local: dist/ytmfast-v@VERSION@-x86_64-unknown-linux-gnu.tar.gz
+  ARM64:
+    file: ytmfast-v@VERSION@-aarch64-unknown-linux-gnu.tar.gz
+    local: dist/ytmfast-v@VERSION@-aarch64-unknown-linux-gnu.tar.gz
+  SOURCE:
+    file: ytmfast-v@VERSION@-source.tar.gz
+    local: dist/ytmfast-v@VERSION@-source.tar.gz
+  MACOS:
+    file: ytmfast-v@VERSION@-macos-universal.dmg
+    local: dist/ytmfast-v@VERSION@-macos-universal.dmg
+templates:
+  arch/ytmfast/PKGBUILD: packaging/arch/ytmfast/PKGBUILD.in
+  arch/ytmfast/ytmfast.install: packaging/arch/ytmfast.install
+  arch/ytmfast-bin/PKGBUILD: packaging/arch/ytmfast-bin/PKGBUILD.in
+  arch/ytmfast-bin/ytmfast-bin.install: packaging/arch/ytmfast.install
+  arch/ytmfast-git/PKGBUILD: packaging/arch/ytmfast-git/PKGBUILD.in
+  arch/ytmfast-git/ytmfast-git.install: packaging/arch/ytmfast.install
+  homebrew/ytmfast.rb: packaging/homebrew/ytmfast.rb.in
+repositories:
+  aur-source:
+    group: aur
+    url: https://aur.archlinux.org/ytmfast.git
+    push_url: ssh://aur@aur.archlinux.org/ytmfast.git
+    branch: master
+    package_path: "."
+    files:
+      arch/ytmfast: "."
+    version_file: ".SRCINFO"
+    version_pattern: "^\\s*pkgver = (\\S+)"
+    publish: push
+  aur-bin:
+    group: aur
+    url: https://aur.archlinux.org/ytmfast-bin.git
+    push_url: ssh://aur@aur.archlinux.org/ytmfast-bin.git
+    branch: master
+    package_path: "."
+    files:
+      arch/ytmfast-bin: "."
+    version_file: ".SRCINFO"
+    version_pattern: "^\\s*pkgver = (\\S+)"
+    publish: push
+  aur-git:
+    group: aur
+    url: https://aur.archlinux.org/ytmfast-git.git
+    push_url: ssh://aur@aur.archlinux.org/ytmfast-git.git
+    branch: master
+    package_path: "."
+    files:
+      arch/ytmfast-git: "."
+    version_file: ".SRCINFO"
+    version_pattern: "^\\s*pkgver = (\\S+)"
+    publish: push
+  homebrew:
+    url: https://github.com/crmne/homebrew-tap.git
+    push_url: https://github.com/crmne/homebrew-tap.git
+    branch: main
+    package_path: Casks
+    files:
+      homebrew/ytmfast.rb: Casks/ytmfast.rb
+    version_file: Casks/ytmfast.rb
+    version_pattern: version "([^"]+)"
+    publish: push
+version_file: Cargo.toml
