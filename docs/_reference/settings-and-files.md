@@ -395,6 +395,8 @@ main fields are:
 | `mac_show_in_dock` | `true` | macOS only: show Ytmfast in the Dock and Cmd+Tab. `false` keeps it in the menu bar only; the menu-bar icon always stays |
 | `check_for_updates` | `true` | Ask GitHub once a day for a newer release |
 | `web_client_id` | none | Client ID of your own Spotify app, which Ytmfast signs in with |
+| `oauth_client_id` | none | Client ID of your own Google Cloud OAuth client (type TVs and Limited Input devices) for Sign in with Google; `YTMFAST_OAUTH_CLIENT_ID` is used when unset |
+| `oauth_client_secret` | none | That client's secret; `YTMFAST_OAUTH_CLIENT_SECRET` is used when unset |
 | `personal_app_nudge_at` | none | Legacy daily-reminder timestamp, retained for older releases |
 | `personal_app_intro_seen` | `false` | Whether the Premium personal-app introduction was dismissed or followed (available since 0.8.0) |
 | `slow_app_banner` | none | When the "Spotify is being slow" banner last appeared (`shown_at`) and how many times it was closed (`dismissals`; at 3 it stops). Kept by the app, not a preference |
@@ -442,7 +444,7 @@ and `--demo-show` adds surfaces on top of it: a comma separated list of
 `library-list-narrow`, `library-list-wide`, `library-grid`, `library-grid-narrow`,
 `library-grid-wide`, `eq-user-presets`, `start-in-tray`, `rtl`, `player-bar-spectrum`, `player-bar-waveform`,
 `lyrics-fullscreen-view`, `lyrics-fullscreen-instrumental`, `signed-out`, `connecting`,
-`sign-in-returning`, `sign-in-malformed`, `sign-in-missing-sapisid`, `sign-in-expired`, `shared-grant`, and `own-app`. The Library variants show the list or cover grid with
+`sign-in-returning`, `sign-in-google-waiting`, `sign-in-cookie`, `sign-in-malformed`, `sign-in-missing-sapisid`, `sign-in-expired`, `shared-grant`, and `own-app`. The Library variants show the list or cover grid with
 a normal, narrow, or wide sidebar and collapsed artwork for matching captures.
 `shuffle-selected` and `shuffle-started` capture the selected-mode and
 playback-started outcomes of a collection Shuffle click. `update` shows a sample
@@ -452,8 +454,10 @@ banner suggesting one when Spotify slows the shared app down. `audio-key-banner`
 whose audio key Spotify refused. `audio-outputs` opens the device picker with sample audio
 outputs to choose from, as Ytmfast's own output lists them.
 `signed-out` and `connecting` show the sign-in card, with the steps for
-copying the YouTube Music cookie, before and while the session connects.
-`sign-in-returning` shows it again after a sign-out, and
+setting up Sign in with Google, before and while the session connects.
+`sign-in-returning` shows it again after a sign-out,
+`sign-in-google-waiting` shows the code Google sign-in waits on,
+`sign-in-cookie` opens the advanced cookie sign-in with its steps, and
 `sign-in-malformed`, `sign-in-missing-sapisid` and `sign-in-expired`
 show each way a pasted cookie can be turned down. `shared-grant` and
 `own-app` are kept from the Spotify days and change nothing on the sign-in card.

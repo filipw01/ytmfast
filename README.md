@@ -21,7 +21,7 @@ cargo run
 | UI | egui + fastframe | same |
 | Catalogue | Spotify Web API | [ytmapi-rs](https://crates.io/crates/ytmapi-rs) (Innertube) |
 | Playback | librespot (Spotify Connect) | [rusty_ytdl](https://crates.io/crates/youtui-vendored-rusty_ytdl) + rodio/symphonia |
-| Auth | Spotify PKCE + desktop client | YouTube Music browser cookie (and demo mode) |
+| Auth | Spotify PKCE + desktop client | Sign in with Google (your own OAuth client), or a browser cookie (and demo mode) |
 | Connect / Cast / Sonos | supported | not ported yet (local playback only) |
 
 Track URIs look like `ytmusic:track:{videoId}`.
@@ -39,11 +39,45 @@ Track URIs look like `ytmusic:track:{videoId}`.
 
 ## Sign in
 
+### Sign in with Google (recommended)
+
+Google sign-in uses the device flow for TVs and limited-input devices, the same one
+[youtui](https://github.com/nick42d/youtui) uses. Google gives no client to share, so you
+create your own OAuth client once in Google Cloud. It is free.
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create a project (or pick one)
+   and enable the **YouTube Data API v3** for it. Google's guide:
+   [Registering an application](https://developers.google.com/youtube/registering_an_application).
+2. Configure the OAuth consent screen. While the app is in *Testing*, add your Google account as a test user.
+3. Under **APIs & Services → Credentials**, choose **Create credentials → OAuth client ID** with
+   application type **TVs and Limited Input devices**.
+4. In Ytmfast, paste the **Client ID** and **Client secret** on the sign-in screen
+   (they are also under **Settings → Account**), then click **Sign in with Google**.
+5. Your browser opens Google's device page with the code filled in. Ytmfast also shows the code;
+   confirm it and allow access. Ytmfast signs in as soon as Google answers.
+
+The Client ID and secret are saved in `settings.json` (`oauth_client_id`, `oauth_client_secret`).
+Google treats a limited-input client's secret as not confidential, but it is still yours: do not
+share it. Instead of Settings you can set `YTMFAST_OAUTH_CLIENT_ID` and
+`YTMFAST_OAUTH_CLIENT_SECRET` (youtui's `YOUTUI_OAUTH_CLIENT_ID` / `YOUTUI_OAUTH_CLIENT_SECRET`
+work too); values in Settings win.
+
+The token Google returns is kept in your system's credential store, never in `settings.json`, and
+Ytmfast refreshes it on its own. Revoking access at
+[myaccount.google.com/permissions](https://myaccount.google.com/permissions) signs Ytmfast out the next
+time it talks to YouTube Music.
+
+### Advanced: paste a browser cookie
+
+Click **Advanced: paste a browser cookie** on the sign-in screen, then:
+
 1. Open [YouTube Music](https://music.youtube.com) in a browser and sign in.
 2. Copy the `Cookie` header from an authenticated request (Network tab → any `browse` call).
-3. Paste it into Ytmfast when asked, or place it where the login screen describes.
+3. Paste it into Ytmfast and click **Sign in with the cookie**.
 
-Unauthenticated use can still search and play many public tracks. Private library shelves need the cookie.
+The cookie works like a password and is kept in the credential store too.
+
+Unauthenticated use can still search and play many public tracks. Private library shelves need a sign-in.
 
 **Playback does not need Spotify Premium.** YouTube Music availability follows Google’s own limits and region rules.
 
