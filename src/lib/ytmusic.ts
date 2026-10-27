@@ -34,13 +34,20 @@ function thumbFrom(item: {
 
 function artistsFrom(item: {
   artists?: Array<{ name?: string; channel_id?: string }>;
+  authors?: Array<{ name?: string; channel_id?: string }>;
   author?: { name?: string; channel_id?: string } | string;
 }): Track["artists"] {
-  if (Array.isArray(item.artists) && item.artists.length) {
-    return item.artists
+  const fromList = (list?: Array<{ name?: string; channel_id?: string }>) =>
+    (list || [])
       .filter((a) => a.name)
       .map((a) => ({ name: a.name!, id: a.channel_id }));
-  }
+
+  const artists = fromList(item.artists);
+  if (artists.length) return artists;
+
+  const authors = fromList(item.authors);
+  if (authors.length) return authors;
+
   if (typeof item.author === "string" && item.author) {
     return [{ name: item.author }];
   }
