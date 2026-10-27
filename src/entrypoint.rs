@@ -3,7 +3,7 @@ use ytmfast::{app, backend, paths, settings, single_instance, util};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use fastframe_shell::window::Geometry;
 
-/// A fast, native Spotify client.
+/// A fast, native YouTube Music client.
 #[derive(Debug, Parser)]
 #[command(name = env!("CARGO_BIN_NAME"), version, about)]
 struct Cli {
@@ -11,7 +11,7 @@ struct Cli {
     #[command(subcommand)]
     control: Option<Control>,
 
-    /// A Spotify link to open: spotify:track:…, or an open.spotify.com
+    /// A YouTube Music link or ytmusic:track:… URI. The running Ytmfast opens it when there is one
     /// address. The running Ytmfast opens it when there is one, which
     /// is how the desktop hands links over.
     #[arg(value_name = "LINK")]
@@ -21,7 +21,7 @@ struct Cli {
     #[arg(long)]
     device_name: Option<String>,
 
-    /// Log more from librespot and the Web API client.
+    /// Log more from the YouTube Music client and player.
     #[arg(short, long)]
     verbose: bool,
 
@@ -31,7 +31,7 @@ struct Cli {
     #[arg(long)]
     start_hidden: bool,
 
-    /// Start with sample data and no Spotify connection (for screenshots).
+    /// Start with sample data and no YouTube Music connection (for screenshots).
     #[cfg(feature = "demo")]
     #[arg(long)]
     demo: bool,
@@ -143,9 +143,9 @@ enum Control {
     Repeat { mode: Option<Repeat> },
     /// Save the playing track to your library, or take it back out
     Like,
-    /// Play a Spotify URI: a track, album, playlist, artist, or show
+    /// Play a YouTube Music URI: a track, album, playlist, artist, or show
     PlayUri { uri: String },
-    /// Search Spotify and play the best match: `play-search danza rota`, or
+    /// Search YouTube Music and play the best match: `play-search danza rota`, or
     /// `play-search --kind artist soda stereo`
     PlaySearch {
         /// What to look for: a song, or an album, artist, or playlist to play from the start
@@ -155,7 +155,7 @@ enum Control {
         #[arg(required = true, num_args = 1..)]
         query: Vec<String>,
     },
-    /// List the local playback devices
+    /// List the playback devices
     Devices {
         /// Print the JSON the running instance sent instead.
         #[arg(long)]
@@ -394,7 +394,7 @@ pub(crate) fn run() -> eframe::Result<()> {
         .map(|text| match ytmfast::link::parse(text) {
             Some(uri) => uri,
             None => {
-                eprintln!("not a Spotify link: {text}");
+                eprintln!("not a YouTube Music link: {text}");
                 std::process::exit(2);
             }
         });
@@ -429,7 +429,7 @@ pub(crate) fn run() -> eframe::Result<()> {
         None
     };
     let default_filter = if cli.verbose {
-        "info,librespot=info,ytmfast=debug"
+        "info,ytmfast=debug"
     } else {
         // Which system face draws each script the interface font lacks,
         // one line per script at startup, for reports of odd-looking text.
