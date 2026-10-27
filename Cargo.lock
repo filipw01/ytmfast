@@ -8629,8 +8629,3 @@ dependencies = [
  "syn 3.0.4",
  "winnow",
 ]
-
-[[patch.unused]]
-name = "hyper-proxy2"
-version = "0.1.0"
-source = "git+https://github.com/crmne/hyper-proxy2?rev=efca4811371ddae81c06be168de54194938d70b1#efca4811371ddae81c06be168de54194938d70b1"
