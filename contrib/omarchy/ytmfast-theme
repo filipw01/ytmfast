@@ -3,8 +3,8 @@
 set -euo pipefail
 
 # These overrides also let the hook be tested without changing the desktop.
-theme_dir=${SPOTIFAST_OMARCHY_THEME_DIR:-$HOME/.local/state/omarchy/current/theme}
-themes_dir=${SPOTIFAST_THEMES_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/spotifast/themes}
+theme_dir=${YTMFAST_OMARCHY_THEME_DIR:-$HOME/.local/state/omarchy/current/theme}
+themes_dir=${YTMFAST_THEMES_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ytmfast/themes}
 source_file=$theme_dir/ytmfast.json
 
 # A theme without a generated palette leaves the last accepted colors alone.
@@ -18,4 +18,4 @@ mv -f -- "$temporary" "$themes_dir/omarchy.json"
 
 # This command only contacts an existing instance. A stopped app stays stopped.
 # The next launch reads the file if no instance is running or predates reload.
-spotifast reload-themes >/dev/null 2>&1 || true
+ytmfast reload-themes >/dev/null 2>&1 || true
