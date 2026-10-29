@@ -106,7 +106,7 @@ pub struct RemoteSnapshot {
 /// Which way the sign-in screen's button signs in.
 enum SignInWith {
     Cookie,
-    Google(crate::auth::OAuthClient),
+    Google,
 }
 
 /// Keep the chosen volume until a poll sent after its write completes can
@@ -122,6 +122,18 @@ struct PendingRemoteVolume {
 }
 
 /// A context shown as playing before Spotify confirms it.
+/// Whether a playlist/album/Liked Songs context has concrete track URIs
+/// for the local engine. YouTube Music does not resolve contexts itself.
+enum ContextTracks {
+    Ready(Vec<String>),
+    /// Rows are still loading; hold the play until they arrive.
+    Pending,
+    /// The context finished loading with nothing playable.
+    Empty,
+    /// Not a local-expandable context.
+    Unsupported,
+}
+
 struct AssumedContext {
     uri: String,
     /// Shuffle state included in the play request, if any.
@@ -1796,7 +1808,9 @@ impl App {
             let row = self.library.liked.items.get(position as usize);
             return Some(row.is_some_and(|row| row.track.uri == uri));
         }
-        let id = context_uri.strip_prefix("spotify:playlist:")?;
+        let id = context_uri
+            .strip_prefix("ytmusic:playlist:")
+            .or_else(|| context_uri.strip_prefix("spotify:playlist:"))?;
         let items = &self.playlist_pages.get(id)?.items;
         let row = items
             .items
@@ -1810,7 +1824,9 @@ impl App {
     /// start, the row holds the song, and every row before it is one both
     /// the Web API and librespot count (no missing or local entries).
     fn repeated_row_position(&self, context_uri: &str, uri: &str, index: u32) -> Option<u32> {
-        let id = context_uri.strip_prefix("spotify:playlist:")?;
+        let id = context_uri
+            .strip_prefix("ytmusic:playlist:")
+            .or_else(|| context_uri.strip_prefix("spotify:playlist:"))?;
         let items = &self.playlist_pages.get(id)?.items;
         if items.base_offset != 0 {
             return None;
@@ -1834,7 +1850,9 @@ impl App {
     /// The song at server `position` of a loaded playlist, so a play started
     /// there by position still shows its song at once.
     fn playlist_track_at(&self, context_uri: &str, position: u32) -> Option<String> {
-        let id = context_uri.strip_prefix("spotify:playlist:")?;
+        let id = context_uri
+            .strip_prefix("ytmusic:playlist:")
+            .or_else(|| context_uri.strip_prefix("spotify:playlist:"))?;
         let items = &self.playlist_pages.get(id)?.items;
         let row = items
             .items
@@ -2779,6 +2797,14 @@ impl App {
                 self.load_playlists();
                 self.ensure_loaded(self.page().clone());
                 self.poll_remote(true);
+                // The cookie (or token) is also the local playback credential,
+                // so enable this computer's player with the sign-in rather
+                // than waiting for a separate "Enable playback" click.
+                if !self.settings.playback_authorized {
+                    self.settings.playback_authorized = true;
+                    self.settings_dirty = true;
+                }
+                self.backend.send(Command::AuthorizePlayback);
             }
             AuthStatus::SignedOut => {
                 if matches!(self.dialog, Some(Dialog::PersonalAppIntro)) {
@@ -2812,7 +2838,7 @@ impl App {
             }
             // The sign-in screen explains it; a toast would say it twice.
             AuthStatus::Refused(_) => self.sign_in_url = None,
-            AuthStatus::WaitingForGoogle { url, .. } => self.sign_in_url = Some(url.clone()),
+            AuthStatus::WaitingForGoogle { url } => self.sign_in_url = Some(url.clone()),
             _ => {}
         }
         self.auth = status;
@@ -3514,7 +3540,10 @@ impl App {
             self.track_used.insert(id.to_owned(), Instant::now());
             return;
         }
-        let found = if let Some(pid) = context_uri.strip_prefix("spotify:playlist:") {
+        let found = if let Some(pid) = context_uri
+            .strip_prefix("ytmusic:playlist:")
+            .or_else(|| context_uri.strip_prefix("spotify:playlist:"))
+        {
             self.playlist_pages.get(pid).and_then(|page| {
                 page.items
                     .items
@@ -3524,7 +3553,10 @@ impl App {
                         _ => None,
                     })
             })
-        } else if let Some(aid) = context_uri.strip_prefix("spotify:album:") {
+        } else if let Some(aid) = context_uri
+            .strip_prefix("ytmusic:album:")
+            .or_else(|| context_uri.strip_prefix("spotify:album:"))
+        {
             self.album_pages.get(aid).and_then(|page| {
                 page.tracks
                     .items
@@ -4215,12 +4247,7 @@ impl App {
                 config,
                 cookie: Some(std::mem::take(&mut self.login_cookie)),
             },
-            Some(SignInWith::Google(client)) => Command::SignInGoogle {
-                request,
-                config,
-                client_id: client.id,
-                client_secret: client.secret,
-            },
+            Some(SignInWith::Google) => Command::SignInGoogle { request, config },
             None => Command::ApplyProxy { request, config },
         });
     }
@@ -7606,6 +7633,7 @@ impl App {
                 if self.table_sorts.contains_key(&Page::Playlist(id.clone())) {
                     self.load_more(Page::Playlist(id));
                 }
+                self.maybe_replay_queued_context_play();
             }
             ApiResponse::PlaylistSample {
                 id,
@@ -7901,6 +7929,7 @@ impl App {
                 if succeeded && (more || self.table_sorts.contains_key(&Page::LikedSongs)) {
                     self.load_more(Page::LikedSongs);
                 }
+                self.maybe_replay_queued_context_play();
             }
             // A reset shelf is read again from the top, so a page asked for
             // before the reset no longer continues it.
@@ -8274,6 +8303,7 @@ impl App {
                     }
                 }
                 self.request_contains(uris);
+                self.maybe_replay_queued_context_play();
             }
             ApiResponse::AlbumTracks {
                 id,
@@ -8303,6 +8333,7 @@ impl App {
                 if self.table_sorts.contains_key(&Page::Album(id.clone())) {
                     self.load_more(Page::Album(id));
                 }
+                self.maybe_replay_queued_context_play();
             }
             ApiResponse::AlbumQueueTracks {
                 request,
@@ -8977,35 +9008,104 @@ impl App {
 
     /// Loaded track URIs for a context, in display order.
     fn context_track_uris(&self, context_uri: &str) -> Option<Vec<String>> {
-        let uris: Vec<String> = if let Some(id) = context_uri.strip_prefix("spotify:playlist:") {
-            self.playlist_pages
-                .get(id)?
+        match self.context_tracks(context_uri) {
+            ContextTracks::Ready(uris) => Some(uris),
+            _ => None,
+        }
+    }
+
+    /// Whether a context has playable rows the local engine can load.
+    fn context_tracks(&self, context_uri: &str) -> ContextTracks {
+        let playlist_id = context_uri
+            .strip_prefix("ytmusic:playlist:")
+            .or_else(|| context_uri.strip_prefix("spotify:playlist:"));
+        let album_id = context_uri
+            .strip_prefix("ytmusic:album:")
+            .or_else(|| context_uri.strip_prefix("spotify:album:"));
+        if let Some(id) = playlist_id {
+            let Some(page) = self.playlist_pages.get(id) else {
+                return ContextTracks::Pending;
+            };
+            let uris: Vec<String> = page
                 .items
                 .items
                 .iter()
                 .filter_map(|item| item.playable())
                 .map(|item| item.uri().to_string())
-                .collect()
-        } else if let Some(id) = context_uri.strip_prefix("spotify:album:") {
-            self.album_pages
-                .get(id)?
+                .collect();
+            if !uris.is_empty() {
+                return ContextTracks::Ready(uris);
+            }
+            if page.items.loaded_once && !page.items.loading {
+                return ContextTracks::Empty;
+            }
+            return ContextTracks::Pending;
+        }
+        if let Some(id) = album_id {
+            let Some(page) = self.album_pages.get(id) else {
+                return ContextTracks::Pending;
+            };
+            let uris: Vec<String> = page
                 .tracks
                 .items
                 .iter()
                 .filter(|track| !track.uri.is_empty())
                 .map(|track| track.uri.clone())
-                .collect()
-        } else if context_uri.ends_with(":collection") {
-            self.library
+                .collect();
+            if !uris.is_empty() {
+                return ContextTracks::Ready(uris);
+            }
+            if page.tracks.loaded_once && !page.tracks.loading
+                || matches!(page.album, Loadable::Failed(_))
+            {
+                return ContextTracks::Empty;
+            }
+            return ContextTracks::Pending;
+        }
+        if context_uri.ends_with(":collection") {
+            let uris: Vec<String> = self
+                .library
                 .liked
                 .items
                 .iter()
                 .map(|item| item.track.uri.clone())
-                .collect()
-        } else {
-            return None;
+                .collect();
+            if !uris.is_empty() {
+                return ContextTracks::Ready(uris);
+            }
+            if self.library.liked.loaded_once && !self.library.liked.loading {
+                return ContextTracks::Empty;
+            }
+            return ContextTracks::Pending;
+        }
+        ContextTracks::Unsupported
+    }
+
+    /// Asks for the rows a context play is waiting on.
+    fn ensure_context_tracks_loading(&mut self, context_uri: &str) {
+        if let Some(page) = Page::decode(&Self::context_page(context_uri)) {
+            self.ensure_loaded(page);
+        }
+    }
+
+    /// Starts a held context play once its rows have loaded (or failed empty).
+    fn maybe_replay_queued_context_play(&mut self) {
+        if !self.local.connected {
+            return;
+        }
+        let Some(request) = self.queued_play.as_ref() else {
+            return;
         };
-        (!uris.is_empty()).then_some(uris)
+        if !request.uris.is_empty() {
+            return;
+        }
+        let Some(context) = request.context_uri.as_deref() else {
+            return;
+        };
+        match self.context_tracks(context) {
+            ContextTracks::Ready(_) | ContextTracks::Empty => self.replay_queued_play(),
+            ContextTracks::Pending | ContextTracks::Unsupported => {}
+        }
     }
 
     fn random_track_in(&self, context_uri: &str) -> Option<String> {
@@ -9141,7 +9241,10 @@ impl App {
         {
             if shuffle {
                 (request.offset_uri, request.offset_position) = self.shuffle_start(context);
-            } else if let Some(id) = context.strip_prefix("spotify:playlist:") {
+            } else if let Some(id) = context
+                .strip_prefix("ytmusic:playlist:")
+                .or_else(|| context.strip_prefix("spotify:playlist:"))
+            {
                 (request.offset_uri, request.offset_position) = self.playlist_start(id);
             }
         }
@@ -9201,11 +9304,58 @@ impl App {
         match self.target() {
             Target::Local if !self.local.connected => {
                 // Hold the request while the local engine reconnects.
+                // Ask for context rows now so they are ready when it is.
+                if request.uris.is_empty()
+                    && let Some(context) = request.context_uri.as_deref()
+                    && matches!(
+                        self.context_tracks(context),
+                        ContextTracks::Pending
+                    )
+                {
+                    self.ensure_context_tracks_loading(context);
+                }
                 self.queued_play = Some(request);
             }
             Target::Local => {
-                self.queued_play = None;
                 let mut load = local_load(&request, shuffle);
+                // The local engine only plays concrete track URIs. Expand a
+                // playlist/album/Liked Songs context here — Spotify's
+                // librespot resolved contexts itself; YouTube Music does not.
+                // When the rows are not loaded yet, hold the play and ask for
+                // them; sending an empty Load only yields "nothing to play".
+                if load.uris.is_empty()
+                    && let Some(context) = load.context_uri.clone()
+                {
+                    match self.context_tracks(&context) {
+                        ContextTracks::Ready(uris) => {
+                            let start = load
+                                .offset_uri
+                                .as_ref()
+                                .and_then(|offset| uris.iter().position(|uri| uri == offset))
+                                .or_else(|| load.offset_index.map(|index| index as usize))
+                                .unwrap_or(0)
+                                .min(uris.len().saturating_sub(1));
+                            load.uris = uris;
+                            load.offset_index = Some(start as u32);
+                        }
+                        ContextTracks::Pending => {
+                            self.queued_play = Some(request);
+                            self.ensure_context_tracks_loading(&context);
+                            self.optimistic_playing = Some((true, Instant::now()));
+                            return;
+                        }
+                        ContextTracks::Empty => {
+                            self.queued_play = None;
+                            self.assumed_context = None;
+                            self.clear_play_pending();
+                            self.optimistic_playing = None;
+                            self.toast(gettext(self.locale, "Nothing to play"));
+                            return;
+                        }
+                        ContextTracks::Unsupported => {}
+                    }
+                }
+                self.queued_play = None;
                 load.repeat = Some(self.local_repeat());
                 self.local_list = load.context_uri.is_none().then(|| load.uris.clone());
                 let shuffle_after = shuffle && load.shuffle.is_none() && !load.uris.is_empty();
@@ -9469,6 +9619,7 @@ impl App {
         {
             self.load_more(Page::Playlist(id.to_string()));
         }
+        self.maybe_replay_queued_context_play();
     }
 
     /// Read the final page once for collaborators when the loaded rows do not
@@ -11668,13 +11819,7 @@ impl App {
                 }
             }
             Action::Reload(page) => self.reload(page),
-            Action::SignIn => match self.settings.oauth_client() {
-                Some(client) => self.request_proxy(Some(SignInWith::Google(client))),
-                None => {
-                    self.auth =
-                        AuthStatus::Refused(crate::backend::SignInProblem::MissingOAuthClient)
-                }
-            },
+            Action::SignIn => self.request_proxy(Some(SignInWith::Google)),
             Action::SignInCookie => self.request_proxy(Some(SignInWith::Cookie)),
             Action::ApplyProxy => self.request_proxy(None),
             Action::ProxyEdited => self.proxy_form_edited = true,
@@ -17456,6 +17601,116 @@ mod tests {
             "the playlist it was left in is kept"
         );
         assert_eq!(request.offset_uri.as_deref(), Some("spotify:track:three"));
+    }
+
+    /// Playing a playlist from the sidebar before its rows are loaded must
+    /// wait for them. An empty Load only yields "nothing to play".
+    #[test]
+    fn playing_an_unloaded_playlist_waits_for_its_rows() {
+        use crate::api::models::{PlayableItem, PlaylistItem, Track};
+        use crate::player::PlayerCommand;
+
+        let row = |uri: &str| PlaylistItem {
+            item: Some(PlayableItem::Track(Track {
+                id: Some(uri.rsplit(':').next().unwrap().into()),
+                uri: uri.into(),
+                name: uri.into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut app = headless_app();
+        app.auth = AuthStatus::Connected {
+            username: "alice".into(),
+        };
+        app.local.connected = true;
+
+        app.apply(
+            Action::PlayContext {
+                uri: "spotify:playlist:pl1".into(),
+                offset_uri: None,
+                offset_index: None,
+            },
+            &ctx,
+        );
+        assert!(
+            app.queued_play.is_some(),
+            "the play is held until playlist rows arrive"
+        );
+        assert!(
+            app.backend
+                .take_player_commands()
+                .iter()
+                .all(|command| !matches!(command, PlayerCommand::Load(load) if load.uris.is_empty())),
+            "an empty Load must not be sent"
+        );
+        let requested = app.backend.take_playlist_item_requests();
+        assert_eq!(
+            requested
+                .iter()
+                .map(|(id, offset, _)| (id.as_str(), *offset))
+                .collect::<Vec<_>>(),
+            [("pl1", 0)],
+            "the playlist's first page is asked for"
+        );
+
+        let generation = app.playlist_pages["pl1"].generation;
+        app.handle_api(ApiResponse::PlaylistItems {
+            id: "pl1".into(),
+            offset: 0,
+            generation,
+            result: Ok(crate::api::models::Page {
+                total: 2,
+                limit: 50,
+                items: vec![row("spotify:track:one"), row("spotify:track:two")],
+                ..Default::default()
+            }),
+        });
+        assert!(app.queued_play.is_none(), "the held play starts once rows land");
+        match app.backend.take_player_commands().as_slice() {
+            [PlayerCommand::Load(load)] => {
+                assert_eq!(
+                    load.uris,
+                    ["spotify:track:one", "spotify:track:two"]
+                );
+                assert_eq!(load.context_uri.as_deref(), Some("spotify:playlist:pl1"));
+                assert_eq!(load.offset_index, Some(0));
+            }
+            other => panic!("expected one Load with the playlist rows, got {other:?}"),
+        }
+
+        // A playlist that finished loading empty reports that, without a Load.
+        app.playlist_pages.insert(
+            "empty".into(),
+            PlaylistPage {
+                items: PagedList {
+                    loaded_once: true,
+                    next_offset: None,
+                    total: Some(0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        app.backend.take_player_commands();
+        app.apply(
+            Action::PlayContext {
+                uri: "spotify:playlist:empty".into(),
+                offset_uri: None,
+                offset_index: None,
+            },
+            &ctx,
+        );
+        assert!(app.queued_play.is_none());
+        assert!(
+            app.backend.take_player_commands().is_empty(),
+            "an empty playlist does not Load"
+        );
+        assert_eq!(
+            app.toasts.last().map(|toast| toast.message.as_str()),
+            Some("Nothing to play")
+        );
     }
 
     /// A restored repeat mode drives local playback until the engine has a
