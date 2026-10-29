@@ -99,10 +99,9 @@ pub enum AuthStatus {
     Starting,
     SignedOut,
     Connecting,
-    /// Google sign-in is waiting for the listener to confirm `user_code` at
-    /// `url`, which opened in the browser.
+    /// Sign in with Google opened `url` (music.youtube.com) and is waiting
+    /// for a YouTube Music session cookie in an installed browser.
     WaitingForGoogle {
-        user_code: String,
         url: String,
     },
     Connected {
@@ -123,7 +122,10 @@ pub enum SignInProblem {
     MissingSapisid,
     /// YouTube Music no longer accepts the cookie or token.
     Expired,
+    /// Sign in with Google timed out before a browser session appeared.
+    BrowserTimedOut,
     /// Sign in with Google needs the listener's OAuth Client ID and secret.
+    /// Kept for older UI copy and demos; the primary flow no longer needs it.
     MissingOAuthClient,
     /// Google does not know the OAuth client, or it is not of the type
     /// "TVs and Limited Input devices".
@@ -135,13 +137,10 @@ pub enum SignInProblem {
 }
 
 impl SignInProblem {
-    fn from_oauth(problem: &crate::auth::OAuthProblem) -> Option<Self> {
-        use crate::auth::OAuthProblem;
+    fn from_browser(problem: &crate::auth::BrowserSignInProblem) -> Option<Self> {
         match problem {
-            OAuthProblem::Denied => Some(Self::OAuthDenied),
-            OAuthProblem::Expired => Some(Self::OAuthExpired),
-            OAuthProblem::InvalidClient => Some(Self::OAuthInvalidClient),
-            OAuthProblem::Cancelled | OAuthProblem::Network(_) | OAuthProblem::Other(_) => None,
+            crate::auth::BrowserSignInProblem::TimedOut => Some(Self::BrowserTimedOut),
+            crate::auth::BrowserSignInProblem::Cancelled => None,
         }
     }
 }
@@ -149,7 +148,8 @@ impl SignInProblem {
 /// What the sign-in screen signs in with.
 enum SignInWith {
     Cookie(Option<String>),
-    Google(crate::auth::OAuthClient),
+    /// Open the system browser and import the YouTube Music session cookie.
+    Google,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -765,12 +765,10 @@ pub enum Command {
         config: ProxyConfig,
         cookie: Option<String>,
     },
-    /// Sign in with Google with the listener's own OAuth client.
+    /// Sign in with Google via the system browser and a local session cookie.
     SignInGoogle {
         request: u64,
         config: ProxyConfig,
-        client_id: String,
-        client_secret: String,
     },
     CancelSignIn,
     SignOut,
@@ -812,16 +810,15 @@ pub enum Command {
         attempt: u64,
         error: ApiError,
     },
-    /// Internal: Google gave the code the listener confirms.
+    /// Internal: the system browser was opened for Google / YouTube Music.
     GoogleCodeShown {
         attempt: u64,
-        user_code: String,
         url: String,
     },
-    /// Internal: Google sign-in ended with a token (as JSON) or why not.
+    /// Internal: browser Google sign-in ended with a cookie or why not.
     GoogleSignInEnded {
         attempt: u64,
-        result: Result<String, crate::auth::OAuthProblem>,
+        result: Result<String, crate::auth::BrowserSignInProblem>,
     },
     /// Internal: a cookie verification ended (success or not).
     SignInEnded {
@@ -2045,7 +2042,7 @@ impl Worker {
             self.finish_proxy_restore();
             match sign_in {
                 Some(SignInWith::Cookie(cookie)) => self.sign_in(cookie),
-                Some(SignInWith::Google(client)) => self.sign_in_google(client),
+                Some(SignInWith::Google) => self.sign_in_google(),
                 None => {}
             }
         }
@@ -2311,24 +2308,10 @@ impl Worker {
                     config,
                     cookie,
                 } => self.change_proxy(request, config, Some(SignInWith::Cookie(cookie))),
-                Command::SignInGoogle {
-                    request,
-                    config,
-                    client_id,
-                    client_secret,
-                } => self.change_proxy(
-                    request,
-                    config,
-                    Some(SignInWith::Google(crate::auth::OAuthClient {
-                        id: client_id,
-                        secret: client_secret,
-                    })),
-                ),
-                Command::GoogleCodeShown {
-                    attempt,
-                    user_code,
-                    url,
-                } => self.on_google_code(attempt, user_code, url),
+                Command::SignInGoogle { request, config } => {
+                    self.change_proxy(request, config, Some(SignInWith::Google))
+                }
+                Command::GoogleCodeShown { attempt, url } => self.on_google_code(attempt, url),
                 Command::GoogleSignInEnded { attempt, result } => {
                     self.on_google_sign_in_ended(attempt, result)
                 }
@@ -3097,16 +3080,10 @@ impl Worker {
         self.on_web_signed_in(ApiSource::Personal, cookie);
     }
 
-    /// Sign in with Google: ask Google for a code, open its page in the
-    /// browser for the listener to confirm, and wait for the token. Nothing
-    /// is stored until the token has been verified like a cookie.
-    fn sign_in_google(&mut self, client: crate::auth::OAuthClient) {
-        if client.id.trim().is_empty() || client.secret.trim().is_empty() {
-            self.emit(Event::Auth(AuthStatus::Refused(
-                SignInProblem::MissingOAuthClient,
-            )));
-            return;
-        }
+    /// Sign in with Google: open music.youtube.com in the system browser and
+    /// wait for a YouTube Music session cookie in an installed browser.
+    /// Nothing is stored until that cookie has been verified.
+    fn sign_in_google(&mut self) {
         self.cancel_google_sign_in();
         self.credentials.invalidate(CredentialSlot::Playback);
         self.restore_pending[CredentialSlot::Playback.index()] = false;
@@ -3116,21 +3093,13 @@ impl Worker {
         self.google_sign_in = Some(cancel);
         self.emit(Event::Auth(AuthStatus::Connecting));
         let commands = self.commands.clone();
+        let url = crate::auth::MUSIC_URL.to_string();
         tokio::spawn(async move {
-            let result = async {
-                let http = ytmapi_rs::Client::new()
-                    .map_err(|error| crate::auth::OAuthProblem::Network(error.to_string()))?;
-                let code = crate::auth::start_google_sign_in(&http, &client).await?;
-                let _ = commands.send(Command::GoogleCodeShown {
-                    attempt,
-                    user_code: code.user_code.clone(),
-                    url: code.url.clone(),
-                });
-                crate::auth::wait_for_google_sign_in(&http, &code, &client, cancelled)
-                    .await
-                    .map(|token| crate::auth::encode_oauth_token(&token))
-            }
-            .await;
+            let _ = commands.send(Command::GoogleCodeShown {
+                attempt,
+                url: url.clone(),
+            });
+            let result = crate::auth::wait_for_browser_music_cookie(cancelled).await;
             let _ = commands.send(Command::GoogleSignInEnded { attempt, result });
         });
     }
@@ -3141,17 +3110,16 @@ impl Worker {
         }
     }
 
-    fn on_google_code(&mut self, attempt: u64, user_code: String, url: String) {
+    fn on_google_code(&mut self, attempt: u64, url: String) {
         if attempt != self.authorization_attempt || self.google_sign_in.is_none() {
             return;
         }
         self.emit(Event::Auth(AuthStatus::WaitingForGoogle {
-            user_code,
             url: url.clone(),
         }));
         tokio::task::spawn_blocking(move || {
             if let Err(error) = crate::opener::open(&url) {
-                log::warn!("unable to open the Google sign-in page: {error}");
+                log::warn!("unable to open YouTube Music for sign-in: {error}");
             }
         });
     }
@@ -3159,19 +3127,19 @@ impl Worker {
     fn on_google_sign_in_ended(
         &mut self,
         attempt: u64,
-        result: Result<String, crate::auth::OAuthProblem>,
+        result: Result<String, crate::auth::BrowserSignInProblem>,
     ) {
         if attempt != self.authorization_attempt || self.google_sign_in.take().is_none() {
             return;
         }
         match result {
-            Ok(token) => {
+            Ok(cookie) => {
                 self.emit(Event::Auth(AuthStatus::Connecting));
-                self.on_web_signed_in(ApiSource::Personal, token);
+                self.on_web_signed_in(ApiSource::Personal, cookie);
             }
-            Err(crate::auth::OAuthProblem::Cancelled) => {}
+            Err(crate::auth::BrowserSignInProblem::Cancelled) => {}
             Err(problem) => {
-                self.emit(Event::Auth(match SignInProblem::from_oauth(&problem) {
+                self.emit(Event::Auth(match SignInProblem::from_browser(&problem) {
                     Some(refused) => AuthStatus::Refused(refused),
                     None => AuthStatus::Failed(format!("Google sign-in failed: {problem}")),
                 }));
@@ -7679,23 +7647,12 @@ mod authorization_tests {
 
     const OAUTH_TOKEN: &str = r#"{"token_type":"Bearer","access_token":"dummy-access","refresh_token":"dummy-refresh","expires_in":3599,"request_time":{"secs_since_epoch":1700000000,"nanos_since_epoch":0},"client_id":"dummy-id","client_secret":"dummy-secret"}"#;
 
-    /// Sign in with Google needs the listener's OAuth client; the token it
-    /// ends with is verified like a cookie, and a refusal is explained on
-    /// the sign-in screen. Only the current attempt counts.
+    /// Sign in with Google verifies the browser cookie it finds, explains a
+    /// timeout on the sign-in screen, and only the current attempt counts.
     #[test]
-    fn google_sign_in_verifies_its_token_and_explains_refusals() {
+    fn google_sign_in_verifies_its_cookie_and_explains_refusals() {
         let (runtime, mut worker, events) = worker("sign-in-with-google");
         let _entered = runtime.enter();
-        worker.sign_in_google(crate::auth::OAuthClient {
-            id: "dummy-id".into(),
-            secret: " ".into(),
-        });
-        assert!(events.try_iter().any(|event| matches!(
-            event,
-            Event::Auth(AuthStatus::Refused(SignInProblem::MissingOAuthClient))
-        )));
-        assert_eq!(worker.authorization_attempt, 0);
-        assert!(worker.google_sign_in.is_none());
 
         let waiting = |worker: &mut Worker| {
             let (cancel, cancelled) = watch::channel(false);
@@ -7704,29 +7661,29 @@ mod authorization_tests {
             (worker.authorization_attempt, cancelled)
         };
         let (attempt, _cancelled) = waiting(&mut worker);
-        worker.on_google_sign_in_ended(attempt, Err(crate::auth::OAuthProblem::Denied));
+        worker.on_google_sign_in_ended(attempt, Err(crate::auth::BrowserSignInProblem::TimedOut));
         assert!(events.try_iter().any(|event| matches!(
             event,
-            Event::Auth(AuthStatus::Refused(SignInProblem::OAuthDenied))
+            Event::Auth(AuthStatus::Refused(SignInProblem::BrowserTimedOut))
         )));
         assert!(worker.google_sign_in.is_none());
 
         let (attempt, cancelled) = waiting(&mut worker);
         worker.cancel_google_sign_in();
         assert!(*cancelled.borrow(), "cancel stops the wait for Google");
-        worker.on_google_sign_in_ended(attempt, Ok(OAUTH_TOKEN.into()));
+        worker.on_google_sign_in_ended(attempt, Ok("SAPISID=dummy;".into()));
         assert!(
             worker.authorizing_source.is_none(),
             "a cancelled sign-in stays cancelled"
         );
 
         let (attempt, _cancelled) = waiting(&mut worker);
-        worker.on_google_sign_in_ended(attempt - 1, Ok(OAUTH_TOKEN.into()));
+        worker.on_google_sign_in_ended(attempt - 1, Ok("SAPISID=dummy;".into()));
         assert!(
             worker.authorizing_source.is_none(),
             "an older attempt is ignored"
         );
-        worker.on_google_sign_in_ended(attempt, Ok(OAUTH_TOKEN.into()));
+        worker.on_google_sign_in_ended(attempt, Ok("SAPISID=dummy;".into()));
         assert_eq!(worker.authorizing_source, Some(ApiSource::Personal));
         assert_eq!(
             worker.api.state(ApiSource::Personal),

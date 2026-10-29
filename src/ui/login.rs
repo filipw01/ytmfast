@@ -14,9 +14,6 @@ use crate::theme;
 const COLUMN: f32 = 368.0;
 /// The space between the sign-in column and the sign-in steps.
 const GUTTER: f32 = 40.0;
-/// Whether the OAuth client fields are open while a client is configured.
-const CLIENT_OPEN_ID: &str = "login-oauth-client-open";
-
 pub fn show(app: &mut App, ui: &mut egui::Ui, connecting: bool) {
     let palette = app.palette;
     egui::CentralPanel::default()
@@ -153,6 +150,10 @@ fn problem_text(locale: crate::i18n::Locale, problem: SignInProblem) -> String {
         SignInProblem::Expired => {
             gettext(locale, "Your YouTube Music sign-in expired. Sign in again.")
         }
+        SignInProblem::BrowserTimedOut => gettext(
+            locale,
+            "No YouTube Music session found in your browsers. Sign in at music.youtube.com, then try again.",
+        ),
         SignInProblem::MissingOAuthClient => gettext(
             locale,
             "Enter the Client ID and Client secret of your Google OAuth client first.",
@@ -206,9 +207,9 @@ fn sign_in_column(app: &mut App, ui: &mut egui::Ui, connecting: bool, beside: Op
         );
     }
     ui.add_space(if steps { 10.0 } else { 22.0 });
-    if let AuthStatus::WaitingForGoogle { user_code, url } = &app.auth {
-        let (user_code, url) = (user_code.clone(), url.clone());
-        waiting_for_google(app, ui, &user_code, &url);
+    if let AuthStatus::WaitingForGoogle { url } = &app.auth {
+        let url = url.clone();
+        waiting_for_google(app, ui, &url);
     } else if connecting {
         ui.horizontal(|ui| {
             ui.add_space((ui.available_width() - 250.0).max(0.0) / 2.0);
@@ -258,14 +259,17 @@ fn sign_in_column(app: &mut App, ui: &mut egui::Ui, connecting: bool, beside: Op
                 palette.secondary,
             );
         } else {
-            google_fields(app, ui);
-            let ready = app.settings.oauth_client().is_some();
-            if ui
-                .add_enabled_ui(ready, |ui| {
-                    big_button(ui, app, &gettext(locale, "Sign in with Google"))
-                })
-                .inner
-            {
+            wrapped(
+                ui,
+                gettext(
+                    locale,
+                    "Opens YouTube Music in your browser. After you sign in there, Ytmfast picks up the session automatically.",
+                ),
+                theme::regular(12.5),
+                palette.secondary,
+            );
+            ui.add_space(6.0);
+            if big_button(ui, app, &gettext(locale, "Sign in with Google")) {
                 app.actions.push(Action::SignIn);
             }
         }
@@ -308,41 +312,26 @@ fn sign_in_column(app: &mut App, ui: &mut egui::Ui, connecting: bool, beside: Op
     ui.data_mut(|data| data.insert_temp(proxy_id, proxy_open));
 }
 
-/// The code to confirm on Google's page, while Ytmfast waits for it.
-fn waiting_for_google(app: &mut App, ui: &mut egui::Ui, user_code: &str, url: &str) {
+/// Waiting while the listener signs in at music.youtube.com in their browser.
+fn waiting_for_google(app: &mut App, ui: &mut egui::Ui, url: &str) {
     let palette = app.palette;
     let locale = app.locale;
-    theme::text(
+    wrapped(
         ui,
-        gettext(locale, "Enter this code on Google's page:"),
+        gettext(
+            locale,
+            "Sign in to YouTube Music in your browser. Ytmfast continues when it finds the session.",
+        ),
         theme::regular(14.0),
         palette.secondary,
     );
-    Frame::new()
-        .fill(palette.surface)
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(20, 10))
-        .show(ui, |ui| {
-            let code = ui.add(
-                egui::Label::new(
-                    egui::RichText::new(user_code)
-                        .font(egui::FontId::monospace(28.0))
-                        .strong()
-                        .color(palette.text),
-                )
-                .selectable(true),
-            );
-            code.widget_info(|| {
-                egui::WidgetInfo::labeled(egui::WidgetType::Label, true, user_code)
-            });
-        });
-    ui.add_space(4.0);
+    ui.add_space(8.0);
     ui.horizontal(|ui| {
-        ui.add_space((ui.available_width() - 190.0).max(0.0) / 2.0);
+        ui.add_space((ui.available_width() - 220.0).max(0.0) / 2.0);
         theme::spinner(ui, 16.0, palette.accent);
         theme::text(
             ui,
-            gettext(locale, "Waiting for Google…"),
+            gettext(locale, "Waiting for your browser…"),
             theme::medium(14.0),
             palette.text,
         );
@@ -363,90 +352,6 @@ fn waiting_for_google(app: &mut App, ui: &mut egui::Ui, user_code: &str, url: &s
             });
         });
     });
-}
-
-/// One line of the OAuth client form. Settings keep what is typed.
-fn client_field(
-    app: &mut App,
-    ui: &mut egui::Ui,
-    id: &str,
-    hint: &str,
-    secret: bool,
-    value: impl Fn(&mut crate::settings::Settings) -> &mut Option<String>,
-) {
-    let palette = app.palette;
-    let locale = app.locale;
-    let mut text = value(&mut app.settings).clone().unwrap_or_default();
-    let response = Frame::new()
-        .fill(palette.surface)
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(12, 7))
-        .show(ui, |ui| {
-            super::widgets::text_edit(
-                ui,
-                locale,
-                egui::TextEdit::singleline(&mut text)
-                    .id(egui::Id::new(id))
-                    .password(secret)
-                    .hint_text(egui::RichText::new(hint).color(palette.dim))
-                    .font(theme::regular(13.5))
-                    .frame(egui::Frame::NONE)
-                    .desired_width(ui.available_width()),
-            )
-        })
-        .inner;
-    if response.changed() {
-        let trimmed = text.trim();
-        *value(&mut app.settings) = (!trimmed.is_empty()).then(|| trimmed.to_string());
-        app.mark_settings_dirty();
-    }
-}
-
-/// The listener's Google OAuth client: its ID and secret, or once both are
-/// set, a link to change them.
-fn google_fields(app: &mut App, ui: &mut egui::Ui) {
-    let palette = app.palette;
-    let locale = app.locale;
-    let open_id = egui::Id::new(CLIENT_OPEN_ID);
-    let configured = app.settings.oauth_client().is_some();
-    let mut open = ui
-        .data(|data| data.get_temp::<bool>(open_id))
-        .unwrap_or(false);
-    if configured && !open {
-        ui.horizontal(|ui| {
-            ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                if theme::link(
-                    ui,
-                    gettext(locale, "Change the Google OAuth client"),
-                    theme::regular(12.5),
-                    palette.secondary,
-                )
-                .clicked()
-                {
-                    open = true;
-                }
-            });
-        });
-    } else {
-        client_field(
-            app,
-            ui,
-            "login-oauth-client-id",
-            &gettext(locale, "OAuth Client ID"),
-            false,
-            |settings| &mut settings.oauth_client_id,
-        );
-        client_field(
-            app,
-            ui,
-            "login-oauth-client-secret",
-            &gettext(locale, "OAuth Client secret"),
-            true,
-            |settings| &mut settings.oauth_client_secret,
-        );
-    }
-    ui.data_mut(|data| data.insert_temp(open_id, open));
-    ui.add_space(2.0);
 }
 
 /// The pasted cookie. It is masked, never saved to settings, and only kept
@@ -520,7 +425,7 @@ fn step(
     ui.add_space(4.0);
 }
 
-/// How to create the Google OAuth client, the way youtui documents it.
+/// How Sign in with Google uses the system browser.
 fn google_steps(app: &mut App, ui: &mut egui::Ui, width: f32) {
     let palette = app.palette;
     let locale = app.locale;
@@ -530,7 +435,7 @@ fn google_steps(app: &mut App, ui: &mut egui::Ui, width: f32) {
     ui.add_space(4.0);
     theme::text(
         ui,
-        gettext(locale, "Set up Sign in with Google"),
+        gettext(locale, "Sign in with Google"),
         theme::bold(18.0),
         palette.text,
     );
@@ -539,21 +444,13 @@ fn google_steps(app: &mut App, ui: &mut egui::Ui, width: f32) {
         ui,
         &palette,
         1,
-        &gettext(
-            locale,
-            "In Google Cloud, enable the YouTube Data API v3 for a project:",
-        ),
+        &gettext(locale, "Choose Sign in with Google. Your browser opens:"),
         |ui| {
-            if theme::link(
-                ui,
-                gettext(locale, "How to register an app"),
-                theme::medium(13.0),
-                palette.accent,
-            )
-            .on_hover_text(crate::auth::OAUTH_SETUP_URL)
-            .clicked()
+            if theme::link(ui, "music.youtube.com", theme::medium(13.0), palette.accent)
+                .on_hover_text(crate::auth::MUSIC_URL)
+                .clicked()
             {
-                ctx.open_url(egui::OpenUrl::new_tab(crate::auth::OAUTH_SETUP_URL));
+                ctx.open_url(egui::OpenUrl::new_tab(crate::auth::MUSIC_URL));
             }
         },
     );
@@ -563,21 +460,9 @@ fn google_steps(app: &mut App, ui: &mut egui::Ui, width: f32) {
         2,
         &gettext(
             locale,
-            "Create an OAuth client ID of type TVs and Limited Input devices:",
+            "Sign in with the Google account that uses YouTube Music.",
         ),
-        |ui| {
-            if theme::link(
-                ui,
-                gettext(locale, "Credentials"),
-                theme::medium(13.0),
-                palette.accent,
-            )
-            .on_hover_text(crate::auth::OAUTH_CONSOLE_URL)
-            .clicked()
-            {
-                ctx.open_url(egui::OpenUrl::new_tab(crate::auth::OAUTH_CONSOLE_URL));
-            }
-        },
+        |_| {},
     );
     step(
         ui,
@@ -585,7 +470,7 @@ fn google_steps(app: &mut App, ui: &mut egui::Ui, width: f32) {
         3,
         &gettext(
             locale,
-            "Paste its Client ID and Client secret here and sign in.",
+            "Leave the browser signed in. Ytmfast reads the session from Chrome, Safari, Firefox, and similar browsers.",
         ),
         |_| {},
     );
@@ -593,7 +478,10 @@ fn google_steps(app: &mut App, ui: &mut egui::Ui, width: f32) {
         ui,
         &palette,
         4,
-        &gettext(locale, "Confirm the code Ytmfast shows on Google's page."),
+        &gettext(
+            locale,
+            "If nothing happens, allow this app to read browser cookies (Full Disk Access on macOS for Safari), or paste a cookie instead.",
+        ),
         |_| {},
     );
 }

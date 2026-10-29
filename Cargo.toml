@@ -175,6 +175,9 @@ base64 = "0.22"
 rfd = "0.17.2"
 rand = "0.9"
 open = "5"
+# Reads the YouTube Music session from the system browser after Sign in with
+# Google opens music.youtube.com. No embedded browser engine (CONTRIBUTING).
+rookie = { version = "0.5.6", default-features = false }
 percent-encoding = "2"
 urlencoding = "2"
 jiff = "0.2"

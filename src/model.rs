@@ -1321,7 +1321,7 @@ pub enum Action {
     },
     ToggleShowAllTop(String),
     Reload(Page),
-    /// Sign in with Google with the OAuth client from Settings.
+    /// Sign in with Google via the system browser and a local session cookie.
     SignIn,
     /// Sign in with the cookie pasted on the sign-in screen.
     SignInCookie,

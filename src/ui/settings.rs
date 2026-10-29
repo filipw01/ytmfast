@@ -406,7 +406,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let sign_out = gettext(locale, "Sign out");
     let oauth_note = gettext(
         locale,
-        "Your own Google Cloud OAuth client, of type TVs and Limited Input devices, for Sign in with Google.",
+        "Legacy OAuth client fields. Sign in with Google now uses your browser session instead.",
     );
     let account_rows = [
         RowText::new(sign_out.clone(), account.clone()),

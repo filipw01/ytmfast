@@ -1,18 +1,17 @@
-//! YouTube Music sign-in: with Google, or with the browser cookie.
+//! YouTube Music sign-in: with Google (via the system browser), or by pasting
+//! a cookie.
 //!
-//! Google sign-in is the device ("TVs and Limited Input devices") flow that
-//! `ytmapi-rs` and youtui use. It needs an OAuth client the listener creates
-//! in their own Google Cloud project; Ytmfast ships none. The browser shows a
-//! code, the listener confirms it, and the token Google hands back is kept as
-//! JSON in the same playback credential a cookie uses. JSON starts with `{`,
-//! which no cookie does, so the two never mix.
+//! **Sign in with Google** opens [music.youtube.com](https://music.youtube.com)
+//! in the system browser. After the listener signs in there, Ytmfast reads the
+//! YouTube Music session cookie from installed browsers (Chrome, Safari,
+//! Firefox, …). No OAuth client and no embedded browser engine: YouTube Music
+//! rejects third-party OAuth tokens on its Innertube API.
 //!
-//! The cookie is the advanced way in: copy the `cookie` request header of any
-//! request to music.youtube.com from the browser's developer tools and paste
-//! it into the sign-in screen.
+//! The advanced path is still pasting the `cookie` request header from a
+//! music.youtube.com tab's developer tools.
 //!
-//! Both are bearer secrets. They are sent only to Google and YouTube, kept
-//! only in the protected credential store as
+//! Cookies (and legacy OAuth JSON blobs) are bearer secrets. They are sent
+//! only to Google and YouTube, kept only in the protected credential store as
 //! [`crate::player::Credentials::with_cookie`], and never logged.
 
 use std::path::Path;
@@ -280,6 +279,189 @@ pub async fn wait_for_google_sign_in(
 /// Where the cookie comes from.
 pub const MUSIC_URL: &str = "https://music.youtube.com";
 
+/// How long Sign in with Google waits for a browser session before giving up.
+pub const BROWSER_SIGN_IN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// How often Sign in with Google re-reads installed browsers for a session.
+pub const BROWSER_SIGN_IN_POLL: Duration = Duration::from_secs(2);
+
+/// Why browser-based Google sign-in did not finish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BrowserSignInProblem {
+    /// The sign-in was cancelled here.
+    Cancelled,
+    /// No YouTube Music session appeared in any browser in time.
+    TimedOut,
+}
+
+impl std::fmt::Display for BrowserSignInProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => write!(f, "Google sign-in was cancelled"),
+            Self::TimedOut => write!(
+                f,
+                "no YouTube Music session found in your browsers; sign in at music.youtube.com and try again"
+            ),
+        }
+    }
+}
+
+/// Domains whose cookies belong on a music.youtube.com request.
+fn youtube_cookie_domain(domain: &str) -> bool {
+    let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+    domain == "youtube.com"
+        || domain.ends_with(".youtube.com")
+        || domain == "google.com"
+        || domain.ends_with(".google.com")
+}
+
+/// Cookie names that sign YouTube Music requests. Zen/Chrome often return
+/// hundreds of unrelated google.com cookies; shipping all of them exceeds
+/// [`MAX_COOKIE_BYTES`] and the browser sign-in path fails with TooLong.
+fn music_session_cookie_name(name: &str) -> bool {
+    matches!(
+        name,
+        "SAPISID"
+            | "__Secure-1PAPISID"
+            | "__Secure-3PAPISID"
+            | "APISID"
+            | "HSID"
+            | "SSID"
+            | "SID"
+            | "SIDCC"
+            | "__Secure-1PSID"
+            | "__Secure-3PSID"
+            | "__Secure-1PSIDTS"
+            | "__Secure-3PSIDTS"
+            | "__Secure-1PSIDCC"
+            | "__Secure-3PSIDCC"
+            | "LOGIN_INFO"
+            | "PREF"
+            | "VISITOR_INFO1_LIVE"
+            | "YSC"
+            | "CONSENT"
+            | "SOCS"
+    )
+}
+
+/// Build a Cookie header from browser cookies, or `None` if SAPISID is missing.
+fn cookie_header_from_browser_cookies(cookies: &[rookie::enums::Cookie]) -> Option<String> {
+    use std::collections::BTreeMap;
+
+    // Prefer youtube.com over google.com when the same name appears in both.
+    let mut pairs: BTreeMap<String, (u8, String)> = BTreeMap::new();
+    for cookie in cookies {
+        if cookie.value.is_empty()
+            || !music_session_cookie_name(&cookie.name)
+            || !youtube_cookie_domain(&cookie.domain)
+        {
+            continue;
+        }
+        let rank = if cookie
+            .domain
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+            .contains("youtube.com")
+        {
+            0u8
+        } else {
+            1u8
+        };
+        match pairs.get(&cookie.name) {
+            Some((held, _)) if *held <= rank => {}
+            _ => {
+                pairs.insert(cookie.name.clone(), (rank, cookie.value.clone()));
+            }
+        }
+    }
+    if !pairs.contains_key(REQUIRED_COOKIE) {
+        return None;
+    }
+    let header = pairs
+        .into_iter()
+        .map(|(name, (_, value))| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    normalize_cookie(&header).ok()
+}
+
+type BrowserLoader = fn(Option<Vec<String>>) -> rookie::Result<Vec<rookie::enums::Cookie>>;
+
+fn browser_loaders() -> Vec<BrowserLoader> {
+    // Chrome / Safari first: most listeners sign in there. Each browser is
+    // tried alone so one locked DB cannot block another.
+    let mut loaders: Vec<BrowserLoader> = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        loaders.push(rookie::safari);
+    }
+    loaders.push(rookie::chrome);
+    loaders.push(rookie::chromium);
+    loaders.push(rookie::edge);
+    loaders.push(rookie::brave);
+    loaders.push(rookie::firefox);
+    loaders.push(rookie::vivaldi);
+    loaders.push(rookie::opera);
+    loaders.push(rookie::arc);
+    loaders.push(rookie::librewolf);
+    loaders.push(rookie::zen);
+    #[cfg(target_os = "macos")]
+    {
+        loaders.push(rookie::opera_gx);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        loaders.push(rookie::cachy);
+    }
+    loaders
+}
+
+/// A YouTube Music cookie from an installed browser, if one is signed in.
+///
+/// Reads local browser cookie stores only; never logs cookie values.
+pub fn youtube_music_cookie_from_browsers() -> Option<String> {
+    let domains = Some(vec!["youtube.com".into(), "google.com".into()]);
+    for loader in browser_loaders() {
+        let Ok(cookies) = loader(domains.clone()) else {
+            continue;
+        };
+        if let Some(header) = cookie_header_from_browser_cookies(&cookies) {
+            return Some(header);
+        }
+    }
+    None
+}
+
+/// Waits until a browser has a YouTube Music session, `cancel` turns true, or
+/// [`BROWSER_SIGN_IN_TIMEOUT`] elapses.
+pub async fn wait_for_browser_music_cookie(
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<String, BrowserSignInProblem> {
+    let deadline = Instant::now() + BROWSER_SIGN_IN_TIMEOUT;
+    loop {
+        if *cancel.borrow() {
+            return Err(BrowserSignInProblem::Cancelled);
+        }
+        let found = tokio::task::spawn_blocking(youtube_music_cookie_from_browsers)
+            .await
+            .unwrap_or(None);
+        if let Some(cookie) = found {
+            return Ok(cookie);
+        }
+        if Instant::now() >= deadline {
+            return Err(BrowserSignInProblem::TimedOut);
+        }
+        tokio::select! {
+            () = tokio::time::sleep(BROWSER_SIGN_IN_POLL) => {}
+            changed = cancel.changed() => {
+                if changed.is_err() || *cancel.borrow() {
+                    return Err(BrowserSignInProblem::Cancelled);
+                }
+            }
+        }
+    }
+}
+
 /// The cookie `ytmapi-rs` signs requests with. Without it a pasted cookie
 /// cannot sign in, however long it is.
 pub const REQUIRED_COOKIE: &str = "SAPISID";
@@ -532,5 +714,57 @@ mod tests {
             Poll::Failed(OAuthProblem::InvalidClient)
         );
         assert_eq!(google_error("not json"), None);
+    }
+
+    fn sample_cookie(domain: &str, name: &str, value: &str) -> rookie::enums::Cookie {
+        rookie::enums::Cookie {
+            domain: domain.into(),
+            path: "/".into(),
+            secure: true,
+            expires: None,
+            name: name.into(),
+            value: value.into(),
+            http_only: false,
+            same_site: 0,
+        }
+    }
+
+    #[test]
+    fn a_browser_cookie_jar_needs_sapisid_on_youtube_or_google() {
+        assert!(cookie_header_from_browser_cookies(&[sample_cookie(
+            ".youtube.com",
+            "SID",
+            "x"
+        )])
+        .is_none());
+        let header = cookie_header_from_browser_cookies(&[
+            sample_cookie(".google.com", "SAPISID", "from-google"),
+            sample_cookie(".youtube.com", "SAPISID", "from-youtube"),
+            sample_cookie(".youtube.com", "HSID", "h"),
+        ])
+        .expect("SAPISID is enough");
+        assert!(header.contains("SAPISID=from-youtube"));
+        assert!(header.contains("HSID=h"));
+        assert!(!header.contains("from-google"));
+    }
+
+    #[test]
+    fn a_crowded_browser_jar_keeps_only_music_session_cookies() {
+        let mut cookies = vec![
+            sample_cookie(".youtube.com", "SAPISID", "sap"),
+            sample_cookie(".youtube.com", "HSID", "h"),
+        ];
+        for i in 0..200 {
+            cookies.push(sample_cookie(
+                ".google.com",
+                &format!("JUNK{i}"),
+                &"x".repeat(200),
+            ));
+        }
+        let header =
+            cookie_header_from_browser_cookies(&cookies).expect("session cookies stay short");
+        assert!(header.contains("SAPISID=sap"));
+        assert!(!header.contains("JUNK"));
+        assert!(header.len() < MAX_COOKIE_BYTES);
     }
 }

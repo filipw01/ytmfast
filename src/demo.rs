@@ -1174,13 +1174,12 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                 app.auth = AuthStatus::SignedOut;
                 app.user = None;
             }
-            // Google sign-in waiting for its code to be confirmed.
+            // Google sign-in waiting for a browser YouTube Music session.
             "sign-in-google-waiting" => {
                 app.auth = AuthStatus::WaitingForGoogle {
-                    user_code: "WXYZ-ABCD".into(),
-                    url: "https://www.google.com/device?user_code=WXYZ-ABCD".into(),
+                    url: crate::auth::MUSIC_URL.into(),
                 };
-                app.sign_in_url = Some("https://www.google.com/device?user_code=WXYZ-ABCD".into());
+                app.sign_in_url = Some(crate::auth::MUSIC_URL.into());
                 app.user = None;
             }
             // The advanced cookie sign-in, open.
@@ -6955,13 +6954,13 @@ mod tests {
             AuthStatus::SignedOut,
             AuthStatus::Connecting,
             AuthStatus::WaitingForGoogle {
-                user_code: "WXYZ-ABCD".into(),
-                url: "https://www.google.com/device?user_code=WXYZ-ABCD".into(),
+                url: crate::auth::MUSIC_URL.into(),
             },
             // The longest explanations, beside the Google steps.
             AuthStatus::Refused(crate::backend::SignInProblem::MalformedCookie),
             AuthStatus::Refused(crate::backend::SignInProblem::MissingSapisid),
             AuthStatus::Refused(crate::backend::SignInProblem::Expired),
+            AuthStatus::Refused(crate::backend::SignInProblem::BrowserTimedOut),
             AuthStatus::Refused(crate::backend::SignInProblem::MissingOAuthClient),
             AuthStatus::Refused(crate::backend::SignInProblem::OAuthInvalidClient),
             AuthStatus::Refused(crate::backend::SignInProblem::OAuthDenied),
