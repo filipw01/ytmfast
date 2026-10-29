@@ -738,14 +738,109 @@ impl Queue {
 // Fetching a song
 // ---------------------------------------------------------------------------
 
-/// The browser YouTube is told it is talking to, for the stream downloads.
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.101 Safari/537.36";
+/// The browser YouTube is told it is talking to, for resolve and googlevideo
+/// downloads. Keep this current: an ancient Chrome build is refused.
+const USER_AGENT_STR: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-/// The most one range request asks for.
-const DOWNLOAD_CHUNK: u64 = 8 * 1024 * 1024;
+/// The most one range request asks for. googlevideo currently refuses larger
+/// closed ranges (and open-ended `bytes=N-`) with 403; 1 MiB still returns 206.
+const DOWNLOAD_CHUNK: u64 = 1024 * 1024;
+
+/// Inclusive end byte for a Range request starting at `start`.
+fn range_end(start: u64, known_length: Option<u64>) -> u64 {
+    let uncapped = start.saturating_add(DOWNLOAD_CHUNK.saturating_sub(1));
+    match known_length {
+        Some(length) if length > 0 => uncapped.min(length - 1),
+        _ => uncapped,
+    }
+}
+
+/// Hard ceiling for a downloaded audio stream. A bogus or malicious
+/// `content_length` used to preallocate the buffer would abort the process
+/// with no Rust panic (empty `panic.log`); keep this to a long high-bitrate
+/// song and refuse anything larger while downloading.
+const MAX_AUDIO_BYTES: u64 = 128 * 1024 * 1024;
+
+/// How much to reserve for a stream whose advertised length is `length`.
+/// Unknown or absurd lengths reserve nothing and grow as chunks arrive.
+fn audio_download_capacity(length: u64) -> usize {
+    (length > 0 && length <= MAX_AUDIO_BYTES)
+        .then_some(length as usize)
+        .unwrap_or(0)
+}
 
 /// How long resolving a video may take.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(40);
+
+/// Headers for watching /player HTML (cookie welcome).
+fn youtube_resolve_headers(
+    cookie: Option<&str>,
+) -> Result<rusty_ytdl::reqwest::header::HeaderMap, LoadError> {
+    use rusty_ytdl::reqwest::header::{HeaderMap, HeaderValue, COOKIE, USER_AGENT};
+
+    let mut headers = HeaderMap::new();
+    headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_STR));
+    if let Some(cookie) = cookie {
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(cookie).map_err(|_| {
+                LoadError::Network(
+                    "the saved cookie cannot be sent to YouTube (invalid characters)".into(),
+                )
+            })?,
+        );
+    }
+    Ok(headers)
+}
+
+/// HTTP client for `rusty_ytdl` stream resolution (its own reqwest 0.13).
+///
+/// When the engine has no proxy URL, environment and system proxies are
+/// disabled so Off matches the documented direct connection (an inherited
+/// `HTTP_PROXY` can reach Music but refuse `www.youtube.com`).
+///
+/// Leave default headers unset unless a cookie is required: rusty_ytdl then
+/// uses its own `DEFAULT_HEADERS`, which is what produces CDN URLs that
+/// actually download (a custom Chrome UA on this client was yielding 403s).
+fn stream_resolve_client(
+    proxy: Option<&reqwest::Url>,
+    cookie: Option<&str>,
+) -> Result<rusty_ytdl::reqwest::Client, LoadError> {
+    let mut builder =
+        rusty_ytdl::reqwest::Client::builder().connect_timeout(Duration::from_secs(15));
+    if cookie.is_some() {
+        builder = builder.default_headers(youtube_resolve_headers(cookie)?);
+    }
+    builder = match proxy {
+        Some(proxy) => builder.proxy(
+            rusty_ytdl::reqwest::Proxy::all(proxy.as_str())
+                .map_err(|error| LoadError::Network(format!("invalid stream proxy: {error}")))?,
+        ),
+        None => builder.no_proxy(),
+    };
+    builder
+        .build()
+        .map_err(|error| LoadError::Network(error_chain(&error)))
+}
+
+/// CDN fetches on rusty_ytdl's reqwest 0.13 stack (same as resolve / probe_play).
+fn stream_download_client(
+    proxy: Option<&reqwest::Url>,
+) -> Result<rusty_ytdl::reqwest::Client, LoadError> {
+    let mut builder = rusty_ytdl::reqwest::Client::builder()
+        .user_agent("Mozilla/5.0")
+        .connect_timeout(Duration::from_secs(15));
+    builder = match proxy {
+        Some(proxy) => builder.proxy(
+            rusty_ytdl::reqwest::Proxy::all(proxy.as_str())
+                .map_err(|error| LoadError::Network(format!("invalid stream proxy: {error}")))?,
+        ),
+        None => builder.no_proxy(),
+    };
+    builder
+        .build()
+        .map_err(|error| LoadError::Network(error_chain(&error)))
+}
 
 /// Songs kept decoded-ready in memory, so a repeat or a skip back is instant.
 const MEMORY_SONGS: usize = 4;
@@ -830,7 +925,10 @@ impl From<rusty_ytdl::VideoError> for LoadError {
             | VideoError::VideoSourceNotFound
             | VideoError::FormatNotFound => Self::Unavailable(error.to_string()),
             VideoError::VideoPlayerResponseError(_) => Self::Refused,
-            other => Self::Network(other.to_string()),
+            VideoError::CookieError => Self::Network(
+                "the saved cookie cannot be sent to YouTube (invalid characters)".into(),
+            ),
+            other => Self::Network(error_chain(&other)),
         }
     }
 }
@@ -839,38 +937,84 @@ impl From<reqwest::Error> for LoadError {
     fn from(error: reqwest::Error) -> Self {
         if error.status() == Some(reqwest::StatusCode::FORBIDDEN) {
             Self::Refused
+        } else if let Some(status) = error.status() {
+            Self::Network(format!("{status}: {}", error_chain(&error)))
         } else {
-            Self::Network(error.to_string())
+            Self::Network(error_chain(&error))
         }
     }
 }
 
+/// The error and each cause, so a Connect/DNS failure is not truncated to
+/// "error sending request for url".
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let next = cause.to_string();
+        if !message.contains(&next) {
+            message.push_str(": ");
+            message.push_str(&next);
+        }
+        source = cause.source();
+    }
+    message
+}
+
+/// Whether a googlevideo URL carries a deciphered `n` throttle token.
+fn stream_url_has_n(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .is_some_and(|parsed| parsed.query_pairs().any(|(key, _)| key == "n"))
+}
+
+fn is_playable_aac_mp4(format: &rusty_ytdl::VideoFormat) -> bool {
+    format.has_audio
+        && !format.is_live
+        && !format.is_hls
+        && !format.url.is_empty()
+        && format.mime_type.container == "mp4"
+        && format
+            .mime_type
+            .audio_codec
+            .as_deref()
+            .is_none_or(|codec| codec.starts_with("mp4a"))
+}
+
 /// The audio stream to play: AAC in MP4, which symphonia decodes, nearest
 /// the bitrate asked for. WebM streams (Opus, Vorbis) have no decoder here.
+///
+/// Adaptive audio-only URLs without an `n` parameter are throttled after
+/// ~1 MiB on googlevideo. Prefer those only when `n` is present; otherwise
+/// use a progressive mp4 (itag 18), which symphonia can demux for audio.
 fn pick_format(
     formats: &[rusty_ytdl::VideoFormat],
     target_bps: u64,
 ) -> Option<&rusty_ytdl::VideoFormat> {
     let bitrate =
         |format: &rusty_ytdl::VideoFormat| format.average_bitrate.unwrap_or(format.bitrate);
+    let score = |format: &&rusty_ytdl::VideoFormat| {
+        let rate = bitrate(format);
+        (rate.abs_diff(target_bps), std::cmp::Reverse(rate))
+    };
+
     formats
         .iter()
         .filter(|format| {
-            format.has_audio
-                && !format.has_video
-                && !format.is_live
-                && !format.is_hls
-                && !format.url.is_empty()
-                && format.mime_type.container == "mp4"
-                && format
-                    .mime_type
-                    .audio_codec
-                    .as_deref()
-                    .is_none_or(|codec| codec.starts_with("mp4a"))
+            is_playable_aac_mp4(format) && !format.has_video && stream_url_has_n(&format.url)
         })
-        .min_by_key(|format| {
-            let rate = bitrate(format);
-            (rate.abs_diff(target_bps), std::cmp::Reverse(rate))
+        .min_by_key(score)
+        .or_else(|| {
+            formats
+                .iter()
+                .filter(|format| is_playable_aac_mp4(format) && format.has_video)
+                .min_by_key(score)
+        })
+        .or_else(|| {
+            formats
+                .iter()
+                .filter(|format| is_playable_aac_mp4(format) && !format.has_video)
+                .min_by_key(score)
         })
 }
 
@@ -993,7 +1137,6 @@ struct Core {
     cookie: Option<String>,
     target_bps: u64,
     normalisation: bool,
-    http: reqwest::Client,
     handle: tokio::runtime::Handle,
     state: Arc<Mutex<LocalState>>,
     notify: Mutex<Notify>,
@@ -1016,13 +1159,10 @@ impl Core {
         cache_dir: PathBuf,
         notify: Notify,
     ) -> Result<Arc<Self>> {
-        let mut http = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .connect_timeout(Duration::from_secs(15));
-        if let Some(proxy) = &proxy {
-            http = http.proxy(reqwest::Proxy::all(proxy.as_str()).context("invalid proxy")?);
-        }
-        let http = http.build().context("unable to create the HTTP client")?;
+        let cookie = credentials.request_cookie();
+        // Stream resolve/download clients are built per fetch with no_proxy when
+        // the engine has no proxy URL (see stream_resolve_client). An inherited
+        // HTTP_PROXY can reach music.youtube.com but refuse www.youtube.com.
 
         let state = Arc::new(Mutex::new(LocalState {
             volume: config.initial_volume,
@@ -1051,10 +1191,9 @@ impl Core {
                 cache_dir,
                 cache_limit: config.audio_cache_limit,
                 proxy,
-                cookie: credentials.request_cookie(),
+                cookie,
                 target_bps: u64::from(config.bitrate_kbps) * 1_000,
                 normalisation: config.normalisation,
-                http,
                 handle: tokio::runtime::Handle::current(),
                 state,
                 notify: Mutex::new(notify),
@@ -1133,6 +1272,7 @@ impl Core {
         });
         self.send(AudioCmd::Halt)?;
         let core = Arc::clone(self);
+        log::info!("loading {uri} ({video_id})");
         self.handle.spawn(async move {
             let outcome = core.prepare(&video_id).await;
             if core.generation.load(Ordering::SeqCst) != generation {
@@ -1305,23 +1445,24 @@ impl Core {
     }
 
     async fn download(&self, video_id: &str) -> Result<(Meta, Vec<u8>), LoadError> {
-        let mut request_options = rusty_ytdl::RequestOptions {
-            cookies: self.cookie.clone(),
-            ..Default::default()
+        // Stream URLs come from YouTube's public player API. Sending the Music
+        // session cookie there often yields CDN links that googlevideo refuses
+        // with 403; a cookie-less resolve returns playable URLs for normal
+        // catalog tracks. Age-gated titles fall back to a signed-in resolve.
+        log::info!(
+            "resolving {video_id} (signed_in={}, proxy={})",
+            self.cookie.is_some(),
+            self.proxy.is_some()
+        );
+        let info = self.resolve_stream_info(video_id, None).await?;
+        let info = if pick_format(&info.formats, self.target_bps).is_some() {
+            info
+        } else if let Some(cookie) = self.cookie.as_deref() {
+            log::info!("retrying {video_id} resolve with the saved cookie");
+            self.resolve_stream_info(video_id, Some(cookie)).await?
+        } else {
+            info
         };
-        if let Some(proxy) = &self.proxy {
-            request_options.proxy = rusty_ytdl::reqwest::Proxy::all(proxy.as_str()).ok();
-        }
-        let video = rusty_ytdl::Video::new_with_options(
-            video_id,
-            rusty_ytdl::VideoOptions {
-                request_options,
-                ..Default::default()
-            },
-        )?;
-        let info = tokio::time::timeout(RESOLVE_TIMEOUT, video.get_info())
-            .await
-            .map_err(|_| LoadError::Network("YouTube took too long to answer".into()))??;
         let format = pick_format(&info.formats, self.target_bps).ok_or_else(|| {
             LoadError::Unavailable("no audio stream this player can decode".into())
         })?;
@@ -1331,50 +1472,112 @@ impl Core {
             .as_deref()
             .and_then(|length| length.parse::<u64>().ok())
             .unwrap_or(0);
+        log::info!(
+            "downloading {video_id} itag={} length={length} bitrate={}",
+            format.itag,
+            format.average_bitrate.unwrap_or(format.bitrate)
+        );
         let bytes = self.download_ranges(&format.url, length).await?;
+        log::info!("downloaded {video_id}: {} bytes", bytes.len());
         Ok((meta, bytes))
+    }
+
+    async fn resolve_stream_info(
+        &self,
+        video_id: &str,
+        cookie: Option<&str>,
+    ) -> Result<rusty_ytdl::VideoInfo, LoadError> {
+        let client = stream_resolve_client(self.proxy.as_ref(), cookie)?;
+        let video = rusty_ytdl::Video::new_with_options(
+            video_id,
+            rusty_ytdl::VideoOptions {
+                request_options: rusty_ytdl::RequestOptions {
+                    client: Some(client),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )?;
+        tokio::time::timeout(RESOLVE_TIMEOUT, video.get_info())
+            .await
+            .map_err(|_| LoadError::Network("YouTube took too long to answer".into()))?
+            .map_err(LoadError::from)
     }
 
     /// The stream, a range at a time as YouTube's own player asks for it:
     /// one request for the whole file is throttled.
     async fn download_ranges(&self, url: &str, length: u64) -> Result<Vec<u8>, LoadError> {
-        let mut out: Vec<u8> = Vec::with_capacity(length as usize);
+        // Never `Vec::with_capacity` a claimed length we cannot hold: on
+        // macOS a huge allocation aborts the process without a Rust panic.
+        let known = (length > 0 && length <= MAX_AUDIO_BYTES).then_some(length);
+        if length > MAX_AUDIO_BYTES {
+            log::warn!(
+                "refusing to preallocate a {length}-byte audio stream; downloading without a known size"
+            );
+        }
+        if let Ok(parsed) = reqwest::Url::parse(url) {
+            let keys: Vec<_> = parsed.query_pairs().map(|(k, _)| k.into_owned()).collect();
+            let bound_ip = parsed
+                .query_pairs()
+                .find(|(k, _)| k == "ip")
+                .map(|(_, v)| v.into_owned());
+            log::info!(
+                "stream url host={} ip={bound_ip:?} keys={keys:?}",
+                parsed.host_str().unwrap_or("?")
+            );
+            // Local debug only: last refused URL for curl comparison.
+            let _ = std::fs::write(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".cache/last-stream-url.txt"),
+                url,
+            );
+        }
+        let http = stream_download_client(self.proxy.as_ref())?;
+        let mut out: Vec<u8> = Vec::with_capacity(audio_download_capacity(length));
         loop {
             let start = out.len() as u64;
-            if length > 0 && start >= length {
+            if let Some(length) = known
+                && start >= length
+            {
                 break;
             }
-            let end = start + DOWNLOAD_CHUNK - 1;
-            let mut attempt = 0;
-            let response = loop {
-                let sent = self
-                    .http
-                    .get(url)
-                    .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
-                    .send()
-                    .await
-                    .and_then(reqwest::Response::error_for_status);
-                match sent {
-                    Ok(response) => break response,
-                    Err(error) if attempt < 2 && error.status().is_none() => {
-                        attempt += 1;
-                        tokio::time::sleep(Duration::from_millis(400 * attempt)).await;
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            };
-            let whole = response.status() == reqwest::StatusCode::OK;
-            let body = response.bytes().await?;
+            if start >= MAX_AUDIO_BYTES {
+                return Err(LoadError::Unavailable(
+                    "audio stream is larger than this player will download".into(),
+                ));
+            }
+            // Never ask past the advertised length, and never more than
+            // DOWNLOAD_CHUNK: larger closed ranges and open-ended ranges are
+            // refused with 403 on current googlevideo edges.
+            let end = range_end(start, known);
+            let response = Self::fetch_stream_range(&http, url, start, end).await?;
+            let whole = response.status() == rusty_ytdl::reqwest::StatusCode::OK;
+            let body = response
+                .bytes()
+                .await
+                .map_err(|error| LoadError::Network(error_chain(&error)))?;
             if whole {
                 // The server ignored the range and sent everything.
+                if body.len() as u64 > MAX_AUDIO_BYTES {
+                    return Err(LoadError::Unavailable(
+                        "audio stream is larger than this player will download".into(),
+                    ));
+                }
                 return Ok(body.to_vec());
             }
             if body.is_empty() {
                 break;
             }
+            if start.saturating_add(body.len() as u64) > MAX_AUDIO_BYTES {
+                return Err(LoadError::Unavailable(
+                    "audio stream is larger than this player will download".into(),
+                ));
+            }
             let short = (body.len() as u64) < DOWNLOAD_CHUNK;
             out.extend_from_slice(&body);
-            if length == 0 && short {
+            if known.is_some_and(|length| out.len() as u64 >= length) {
+                break;
+            }
+            if known.is_none() && short {
                 break;
             }
         }
@@ -1382,6 +1585,46 @@ impl Core {
             return Err(LoadError::Unavailable("the stream was empty".into()));
         }
         Ok(out)
+    }
+
+    /// One googlevideo range GET on rusty_ytdl's reqwest.
+    async fn fetch_stream_range(
+        http: &rusty_ytdl::reqwest::Client,
+        url: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<rusty_ytdl::reqwest::Response, LoadError> {
+        use rusty_ytdl::reqwest::header::RANGE;
+
+        let host = rusty_ytdl::reqwest::Url::parse(url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string))
+            .unwrap_or_else(|| "googlevideo".into());
+        let range = format!("bytes={start}-{end}");
+
+        let mut attempt = 0u32;
+        let response = loop {
+            match http.get(url).header(RANGE, range.as_str()).send().await {
+                Ok(response) => break response,
+                Err(_error) if attempt < 2 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(400 * u64::from(attempt))).await;
+                }
+                Err(error) => {
+                    return Err(LoadError::Network(error_chain(&error)));
+                }
+            }
+        };
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+        let body = response.text().await.unwrap_or_default();
+        let snippet: String = body.chars().take(180).collect();
+        log::warn!("stream download {host} {range}: {status} body={snippet:?}");
+        Err(LoadError::Network(format!(
+            "stream download {host} refused ({status}): {snippet}"
+        )))
     }
 
     fn gain_for(&self, meta: &Meta) -> f64 {
@@ -2199,11 +2442,19 @@ impl Engine {
     fn load(&self, spec: LoadSpec) -> Result<()> {
         let core = &self.core;
         let mut uris = spec.uris;
-        if uris.is_empty()
-            && let Some(context) = &spec.context_uri
-            && video_id_from_uri(context).is_ok()
-        {
-            uris.push(context.clone());
+        if uris.is_empty() {
+            // A single-song "context" is itself the track. When the UI still
+            // hands a playlist/album context without expanding it, play at
+            // least the chosen offset track rather than failing open.
+            if let Some(context) = &spec.context_uri
+                && video_id_from_uri(context).is_ok()
+            {
+                uris.push(context.clone());
+            } else if let Some(offset) = &spec.offset_uri
+                && video_id_from_uri(offset).is_ok()
+            {
+                uris.push(offset.clone());
+            }
         }
         if uris.is_empty() {
             bail!("nothing to play");
@@ -2812,6 +3063,83 @@ mod tests {
         assert_eq!(id, config.device_id());
     }
 
+    /// A normal song size is reserved up front; unknown and absurd lengths
+    /// are not, so a bad `content_length` cannot abort the process.
+    #[test]
+    fn audio_download_capacity_ignores_absurd_lengths() {
+        assert_eq!(audio_download_capacity(0), 0);
+        assert_eq!(audio_download_capacity(3 * 1024 * 1024), 3 * 1024 * 1024);
+        assert_eq!(audio_download_capacity(MAX_AUDIO_BYTES), MAX_AUDIO_BYTES as usize);
+        assert_eq!(audio_download_capacity(MAX_AUDIO_BYTES + 1), 0);
+        assert_eq!(audio_download_capacity(u64::MAX), 0);
+    }
+
+    #[test]
+    fn range_requests_stop_at_the_advertised_length() {
+        assert_eq!(
+            range_end(0, Some(4_129_740)),
+            DOWNLOAD_CHUNK - 1,
+            "first chunk stays within DOWNLOAD_CHUNK even when the file is larger"
+        );
+        assert_eq!(range_end(0, Some(DOWNLOAD_CHUNK)), DOWNLOAD_CHUNK - 1);
+        assert_eq!(range_end(0, None), DOWNLOAD_CHUNK - 1);
+        assert_eq!(
+            range_end(4_000_000, Some(4_129_740)),
+            4_129_739,
+            "a mid-file chunk must not run past the end"
+        );
+        assert_eq!(
+            range_end(0, Some(512 * 1024)),
+            512 * 1024 - 1,
+            "files smaller than DOWNLOAD_CHUNK still clamp to length-1"
+        );
+    }
+
+    /// A direct stream client (no engine proxy) builds with a cookie header.
+    #[test]
+    fn stream_resolve_builds_a_direct_client() {
+        stream_resolve_client(None, Some("SAPISID=dummy;")).expect("direct client");
+        stream_resolve_client(None, None).expect("direct client without cookie");
+        stream_download_client(None).expect("googlevideo client");
+    }
+
+    #[test]
+    fn stream_resolve_rejects_a_cookie_that_cannot_be_a_header() {
+        let err = stream_resolve_client(None, Some("SAPISID=a\nb")).expect_err("newline");
+        assert!(
+            matches!(err, LoadError::Network(ref message) if message.contains("invalid characters")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn network_errors_keep_their_cause_chain() {
+        #[derive(Debug)]
+        struct Outer;
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error sending request")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&Inner)
+            }
+        }
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("dns failed")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        let detail = error_chain(&Outer);
+        assert!(detail.contains("error sending request"), "{detail}");
+        assert!(detail.contains("dns failed"), "{detail}");
+    }
+
     /// A track that was playing or paused is remembered with its position;
     /// nothing is once playback has stopped.
     #[test]
@@ -2845,7 +3173,12 @@ mod tests {
 
     #[test]
     fn the_stream_nearest_the_bitrate_asked_for_is_picked() {
-        let format = |itag: u64, bitrate: u64, container: &str, audio_only: bool| {
+        let format = |itag: u64, bitrate: u64, container: &str, audio_only: bool, with_n: bool| {
+            let url = if with_n {
+                "https://example.com/stream?n=token"
+            } else {
+                "https://example.com/stream"
+            };
             let format: rusty_ytdl::VideoFormat = serde_json::from_value(serde_json::json!({
                 "itag": itag,
                 "mimeType": format!(
@@ -2854,7 +3187,7 @@ mod tests {
                     if container == "mp4" { "mp4a.40.2" } else { "opus" },
                 ),
                 "bitrate": bitrate,
-                "url": "https://example.com/stream",
+                "url": url,
                 "hasAudio": true,
                 "hasVideo": !audio_only,
                 "isLive": false,
@@ -2865,17 +3198,27 @@ mod tests {
             format
         };
         let formats = vec![
-            format(139, 48_000, "mp4", true),
-            format(140, 128_000, "mp4", true),
-            format(141, 256_000, "mp4", true),
-            format(251, 160_000, "webm", true),
-            format(18, 500_000, "mp4", false),
+            format(139, 48_000, "mp4", true, true),
+            format(140, 128_000, "mp4", true, true),
+            format(141, 256_000, "mp4", true, true),
+            format(251, 160_000, "webm", true, true),
+            format(18, 500_000, "mp4", false, false),
         ];
         let picked = |kbps: u64| pick_format(&formats, kbps * 1_000).map(|format| format.itag);
         assert_eq!(picked(320), Some(141));
         assert_eq!(picked(160), Some(140));
-        assert_eq!(picked(64), Some(139), "webm and video are never picked");
-        assert_eq!(pick_format(&formats[3..], 320_000).map(|f| f.itag), None);
+        assert_eq!(picked(64), Some(139), "webm is never picked");
+        assert_eq!(pick_format(&formats[3..], 320_000).map(|f| f.itag), Some(18));
+
+        let throttled = vec![
+            format(140, 128_000, "mp4", true, false),
+            format(18, 500_000, "mp4", false, false),
+        ];
+        assert_eq!(
+            pick_format(&throttled, 160_000).map(|format| format.itag),
+            Some(18),
+            "audio-only without n falls back to progressive mp4"
+        );
     }
 
     /// Needs the network and YouTube's goodwill: `cargo test -- --ignored`.
